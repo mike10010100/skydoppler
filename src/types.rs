@@ -535,6 +535,9 @@ pub struct PostEngagementSnapshot {
     /// Total AppView quote count.
     #[serde(default)]
     pub quote_count: u64,
+    /// Compact embed kind summary extracted from the post record (e.g. `"external_link"`, `"images"`, `"video"`, `"quote_post"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embed_kind: Option<String>,
 }
 
 /// Lightweight profile metadata fetched from `app.bsky.actor.getProfiles`.
@@ -551,6 +554,9 @@ pub struct ActorSummary {
     /// Follower count, if known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub followers_count: Option<u64>,
+    /// Profile bio / description, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Follow relationship bitmask returned by `app.bsky.graph.getRelationships` relative to Target.

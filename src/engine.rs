@@ -33,11 +33,12 @@ use crate::types::{
 
 const STATS_META_KEY: &str = "engine_stats_v1";
 const MIN_CATALYST_ENGAGEMENT: u64 = 5;
+const MIN_CATALYST_DUNK_RATIO: f64 = 0.50;
 const MIN_STANCE_STRUCTURAL_SCORE: f64 = 0.30;
 const MIN_STANCE_OON_RATIO: f64 = 0.25;
-const MIN_STANCE_DIRECT_RATIO: f64 = 0.25;
+const MIN_STANCE_DIRECT_RATIO: f64 = 0.60;
 const MIN_STANCE_DUNK_RATIO: f64 = 1.0;
-const BENIGN_VIRAL_VETO_CONFIDENCE: f64 = 0.70;
+const BENIGN_VIRAL_VETO_CONFIDENCE: f64 = 0.60;
 
 /// Thread-safe atomic counters tracking firehose throughput and radar detections.
 #[derive(Debug, Default)]
@@ -506,10 +507,12 @@ impl SkydopplerEngine {
             sb.cmp(&sa)
         });
 
-        // 2. Batched getProfiles (target + top engaged catalyst author)
-        let engaged_top_qt = quote_snaps
-            .first()
-            .filter(|qt| qt.like_count.saturating_add(qt.repost_count) >= MIN_CATALYST_ENGAGEMENT);
+        // 2. Batched getProfiles (target + top engaged dunk catalyst author)
+        let root_likes = focal_post.as_ref().map_or(0, |f| f.like_count);
+        let engaged_top_qt = quote_snaps.first().filter(|qt| {
+            qt.like_count.saturating_add(qt.repost_count) >= MIN_CATALYST_ENGAGEMENT
+                && compute_dunk_ratio(qt.like_count, root_likes) >= MIN_CATALYST_DUNK_RATIO
+        });
         let mut profile_dids = vec![candidate.target_did.clone()];
         if let Some(top_qt) = engaged_top_qt {
             if !top_qt.author_did.is_empty() && !profile_dids.contains(&top_qt.author_did) {
@@ -524,6 +527,8 @@ impl SkydopplerEngine {
         let target_handle = target_profile
             .and_then(|p| p.handle.clone())
             .or_else(|| focal_post.as_ref().and_then(|f| f.author_handle.clone()));
+        let target_display_name = target_profile.and_then(|p| p.display_name.clone());
+        let target_bio = target_profile.and_then(|p| p.description.clone());
         let target_tier = TargetTier::from_followers(target_followers);
 
         // 3. On-demand pairwise out-of-network ratio via getRelationships (no global graph needed!)
@@ -556,7 +561,6 @@ impl SkydopplerEngine {
             );
         }
 
-        let root_likes = focal_post.as_ref().map_or(0, |f| f.like_count);
         let top_catalyst = if let Some(top_qt) = engaged_top_qt {
             let cat_followers = profiles
                 .iter()
@@ -600,12 +604,20 @@ impl SkydopplerEngine {
             target_tier,
         );
 
+        let min_oon_authors = match target_tier {
+            TargetTier::Large | TargetTier::PublicFigure => self.config.min_unique_authors,
+            TargetTier::Small | TargetTier::Mid | TargetTier::Unknown => {
+                (self.config.min_unique_authors / 2).max(2)
+            }
+        };
         let has_distress = distress_total >= self.config.defensive_distress_threshold;
+        let has_sufficient_oon = metrics.unique_oon_authors_short >= min_oon_authors
+            && metrics.out_of_network_ratio >= MIN_STANCE_OON_RATIO;
         let has_hostile_signal = metrics.direct_ratio >= MIN_STANCE_DIRECT_RATIO
             || metrics.dunk_ratio >= MIN_STANCE_DUNK_RATIO
             || has_distress;
         let qualifies_for_stance = metrics.structural_score >= MIN_STANCE_STRUCTURAL_SCORE
-            && (metrics.out_of_network_ratio >= MIN_STANCE_OON_RATIO || has_distress)
+            && (has_sufficient_oon || has_distress)
             && has_hostile_signal;
 
         // 4. Optional Stage 3 bundled LLM stance check
@@ -616,6 +628,8 @@ impl SkydopplerEngine {
             let input = StormStanceInput {
                 target_did: candidate.target_did.clone(),
                 target_handle: target_handle.clone(),
+                target_display_name,
+                target_bio,
                 target_tier,
                 focal_post_uri: candidate.focal_post_uri.clone(),
                 focal_post: focal_post.clone(),
@@ -652,7 +666,7 @@ impl SkydopplerEngine {
                     && s.category == StormCategory::BenignViral
                     && s.confidence >= BENIGN_VIRAL_VETO_CONFIDENCE
             });
-        let confirmed = if llm_benign_veto {
+        let confirmed = if !qualifies_for_stance || llm_benign_veto {
             false
         } else if used_llm {
             metrics.composite_score >= self.config.confirmed_score_threshold
@@ -945,6 +959,7 @@ mod tests {
             repost_count: 1,
             like_count: 3,
             quote_count: 12,
+            ..Default::default()
         });
         enricher.set_post(PostEngagementSnapshot {
             uri: qt_uri.to_string(),
@@ -956,6 +971,7 @@ mod tests {
             repost_count: 90,
             like_count: 1200,
             quote_count: 5,
+            ..Default::default()
         });
         enricher.set_profile(ActorSummary {
             did: "did:plc:small".to_string(),
@@ -1049,6 +1065,7 @@ mod tests {
             repost_count: 5,
             like_count: 35,
             quote_count: 18,
+            ..Default::default()
         });
         enricher.set_post(PostEngagementSnapshot {
             uri: zero_qt_uri.to_string(),
@@ -1060,6 +1077,7 @@ mod tests {
             repost_count: 0,
             like_count: 0,
             quote_count: 0,
+            ..Default::default()
         });
         enricher.set_profile(ActorSummary {
             did: "did:plc:qa".to_string(),
@@ -1143,6 +1161,7 @@ mod tests {
             repost_count: 1,
             like_count: 2,
             quote_count: 15,
+            ..Default::default()
         });
         enricher.set_profile(ActorSummary {
             did: "did:plc:dunked".to_string(),
@@ -1168,6 +1187,7 @@ mod tests {
                 repost_count: 80,
                 like_count: 900,
                 quote_count: 4,
+                ..Default::default()
             }],
         );
         let dunk_cand = NetworkSurgeCandidate {
@@ -1250,6 +1270,177 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+        assert_eq!(stance.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn engine_gates_beloved_viral_posts_and_low_oon_mega_blips_while_confirming_outlet_backlash(
+    ) {
+        let enricher = Arc::new(MockNetworkEnricher::new());
+        let stance = Arc::new(MockStormStanceClassifier::new(StormStanceVerdict::new(
+            true,
+            0.95,
+            StormCategory::PublicFigureBacklash,
+            "Direct editorial backlash",
+            "mock-stance",
+        )));
+
+        // 1. Beloved viral post (1,384 likes vs 122 replies -> direct_ratio 0.30, minor quote 44 likes -> dunk 0.03)
+        let beloved_uri = "at://did:plc:beloved/app.bsky.feed.post/3kbel";
+        let minor_qt = "at://did:plc:commenter/app.bsky.feed.post/3kcm";
+        enricher.set_post(PostEngagementSnapshot {
+            uri: beloved_uri.to_string(),
+            author_did: "did:plc:beloved".to_string(),
+            author_handle: Some("beloved.bsky.social".to_string()),
+            author_followers: Some(13_500),
+            text: "Sarcastic commentary on discourse".to_string(),
+            reply_count: 122,
+            repost_count: 128,
+            like_count: 1384,
+            quote_count: 332,
+            embed_kind: Some("images".to_string()),
+        });
+        enricher.set_post(PostEngagementSnapshot {
+            uri: minor_qt.to_string(),
+            author_did: "did:plc:commenter".to_string(),
+            author_handle: Some("commenter.bsky.social".to_string()),
+            author_followers: Some(27_180),
+            text: "Agreement commentary".to_string(),
+            like_count: 44,
+            repost_count: 2,
+            ..Default::default()
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:beloved".to_string(),
+            handle: Some("beloved.bsky.social".to_string()),
+            followers_count: Some(13_500),
+            ..Default::default()
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:commenter".to_string(),
+            handle: Some("commenter.bsky.social".to_string()),
+            followers_count: Some(27_180),
+            ..Default::default()
+        });
+
+        let cfg = RadarConfig::default()
+            .with_min_unique_authors(8)
+            .with_enable_llm_stance(true);
+        let engine = SkydopplerEngineBuilder::new(cfg)
+            .with_enricher(enricher.clone())
+            .with_stance_classifier(stance.clone())
+            .build()
+            .unwrap();
+
+        let beloved_cand = NetworkSurgeCandidate {
+            target_did: "did:plc:beloved".to_string(),
+            focal_post_uri: beloved_uri.to_string(),
+            observed_at_us: current_time_us(),
+            initial_metrics: StormMetrics {
+                unique_authors_short: 8,
+                unique_oon_authors_short: 8,
+                burst_z_score: 10.6,
+                ..Default::default()
+            },
+            sample_replies: vec![SampleReply {
+                author_did: "did:plc:s1".to_string(),
+                kind: InteractionKind::Reply,
+                post_uri: "at://did:plc:s1/app.bsky.feed.post/1".to_string(),
+                text_snippet: "Totally true lol".to_string(),
+            }],
+            recent_quote_uris: vec![minor_qt.to_string()],
+        };
+        assert!(engine
+            .evaluate_candidate(beloved_cand)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(stance.call_count(), 0);
+
+        // 2. Low-OON blip on PublicFigure (665k followers, 4 OON authors < min_unique_authors=8)
+        let outlet_blip_uri = "at://did:plc:outlet/app.bsky.feed.post/3kblip";
+        enricher.set_post(PostEngagementSnapshot {
+            uri: outlet_blip_uri.to_string(),
+            author_did: "did:plc:outlet".to_string(),
+            author_handle: Some("outlet.com".to_string()),
+            author_followers: Some(665_000),
+            text: "Breaking headline update".to_string(),
+            reply_count: 16,
+            repost_count: 1,
+            like_count: 3,
+            quote_count: 4,
+            embed_kind: Some("external_link".to_string()),
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:outlet".to_string(),
+            handle: Some("outlet.com".to_string()),
+            display_name: Some("Major Outlet".to_string()),
+            followers_count: Some(665_000),
+            description: Some("Breaking news".to_string()),
+        });
+        let blip_cand = NetworkSurgeCandidate {
+            target_did: "did:plc:outlet".to_string(),
+            focal_post_uri: outlet_blip_uri.to_string(),
+            observed_at_us: current_time_us(),
+            initial_metrics: StormMetrics {
+                unique_authors_short: 4,
+                unique_oon_authors_short: 4,
+                burst_z_score: 9.0,
+                ..Default::default()
+            },
+            sample_replies: vec![SampleReply {
+                author_did: "did:plc:r1".to_string(),
+                kind: InteractionKind::Reply,
+                post_uri: "at://did:plc:r1/app.bsky.feed.post/1".to_string(),
+                text_snippet: "Mocking news subject".to_string(),
+            }],
+            recent_quote_uris: vec![],
+        };
+        assert!(engine
+            .evaluate_candidate(blip_cand)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(stance.call_count(), 0);
+
+        // 3. Genuine PublicFigureBacklash directed at outlet's own framing (12 OON >= 8, direct_ratio=12.0)
+        let outlet_backlash_uri = "at://did:plc:outlet/app.bsky.feed.post/3kbacklash";
+        enricher.set_post(PostEngagementSnapshot {
+            uri: outlet_backlash_uri.to_string(),
+            author_did: "did:plc:outlet".to_string(),
+            author_handle: Some("outlet.com".to_string()),
+            author_followers: Some(665_000),
+            text: "Opinion: Why Both Sides Share Equal Blame".to_string(),
+            reply_count: 140,
+            repost_count: 4,
+            like_count: 10,
+            quote_count: 40,
+            embed_kind: Some("external_link".to_string()),
+        });
+        let backlash_cand = NetworkSurgeCandidate {
+            target_did: "did:plc:outlet".to_string(),
+            focal_post_uri: outlet_backlash_uri.to_string(),
+            observed_at_us: current_time_us(),
+            initial_metrics: StormMetrics {
+                unique_authors_short: 14,
+                unique_oon_authors_short: 14,
+                burst_z_score: 10.0,
+                ..Default::default()
+            },
+            sample_replies: vec![SampleReply {
+                author_did: "did:plc:r2".to_string(),
+                kind: InteractionKind::Reply,
+                post_uri: "at://did:plc:r2/app.bsky.feed.post/1".to_string(),
+                text_snippet: "Embarrassing outlet framing".to_string(),
+            }],
+            recent_quote_uris: vec![],
+        };
+        let confirmed = engine
+            .evaluate_candidate(backlash_cand)
+            .await
+            .unwrap()
+            .expect("genuine editorial backlash should confirm");
+        assert_eq!(confirmed.category, StormCategory::PublicFigureBacklash);
         assert_eq!(stance.call_count(), 1);
     }
 }
