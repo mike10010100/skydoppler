@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-11-20
+
+### Added
+
+- **Stage 3 Target-Attribution Disambiguation (`src/types.rs`, `src/enricher.rs`, `src/stance.rs`, `src/engine.rs`)**:
+  - Added profile `description` (bio), `display_name`, and focal `embed_kind` (`external_link`, `images`, `video`, `quote_post`, `quote_with_media`) enrichment and included them in `StormStanceInput` / `format_bundle_prompt`.
+  - Upgraded the Stage 3 Ollama JSON schema and prompt with explicit `hostility_directed_at_author` and `hostility_target` (`post_author`, `third_party_subject`, `none`) fields plus `third_party_news_reaction` classification, deterministically filtering out news/aggregator/screenshot outrage directed at third-party subjects while keeping direct backlash against an outlet's own framing or conduct.
+
+### Changed
+
+- **Stage 2/3 Ratio, Dunk & Tier-Scaled OON Gates (`src/engine.rs`)**:
+  - Raised `MIN_STANCE_DIRECT_RATIO` (`0.25` -> `0.60`), added `MIN_CATALYST_DUNK_RATIO` (`0.50`) so high-like supportive posts with minor quote-posts cannot inflate `power_asymmetry`, and enforced tier-scaled minimum OON responders (`min_unique_authors` for `Large`/`PublicFigure`, `(min_unique_authors / 2).max(2)` for `Small`/`Mid`/`Unknown`) alongside requiring `qualifies_for_stance` for confirmation.
+
 ## [0.2.0] - 2026-11-20
 
 ### Added

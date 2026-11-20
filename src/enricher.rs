@@ -219,6 +219,7 @@ struct GetProfileItem {
     handle: Option<String>,
     display_name: Option<String>,
     followers_count: Option<u64>,
+    description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,6 +279,23 @@ impl PublicAppViewEnricher {
         }
     }
 
+    fn extract_embed_kind(record: Option<&serde_json::Value>) -> Option<String> {
+        let embed_type = record?.get("embed")?.get("$type")?.as_str()?;
+        if embed_type.contains("recordWithMedia") {
+            Some("quote_with_media".to_string())
+        } else if embed_type.contains("external") {
+            Some("external_link".to_string())
+        } else if embed_type.contains("images") {
+            Some("images".to_string())
+        } else if embed_type.contains("video") {
+            Some("video".to_string())
+        } else if embed_type.contains("record") {
+            Some("quote_post".to_string())
+        } else {
+            None
+        }
+    }
+
     fn map_post_view(p: GetPostsView) -> PostEngagementSnapshot {
         let author_did = p.author.as_ref().map(|a| a.did.clone()).unwrap_or_default();
         let author_handle = p.author.as_ref().and_then(|a| a.handle.clone());
@@ -289,6 +307,7 @@ impl PublicAppViewEnricher {
             .and_then(|t| t.as_str())
             .unwrap_or("")
             .to_string();
+        let embed_kind = Self::extract_embed_kind(p.record.as_ref());
         PostEngagementSnapshot {
             uri: p.uri,
             author_did,
@@ -299,6 +318,7 @@ impl PublicAppViewEnricher {
             repost_count: p.repost_count.unwrap_or(0),
             like_count: p.like_count.unwrap_or(0),
             quote_count: p.quote_count.unwrap_or(0),
+            embed_kind,
         }
     }
 }
@@ -380,6 +400,7 @@ impl NetworkEnricher for PublicAppViewEnricher {
                         handle: item.handle,
                         display_name: item.display_name,
                         followers_count: item.followers_count,
+                        description: item.description,
                     });
                 }
             }
@@ -518,7 +539,10 @@ mod tests {
                 "posts": [{
                     "uri": "at://did:plc:alice/app.bsky.feed.post/1",
                     "author": { "did": "did:plc:alice", "handle": "alice.bsky.social", "followersCount": 300 },
-                    "record": { "text": "hello world" },
+                    "record": {
+                        "text": "hello world",
+                        "embed": { "$type": "app.bsky.embed.external" }
+                    },
                     "replyCount": 42,
                     "repostCount": 2,
                     "likeCount": 4,
@@ -535,7 +559,8 @@ mod tests {
                     "did": "did:plc:alice",
                     "handle": "alice.bsky.social",
                     "displayName": "Alice",
-                    "followersCount": 300
+                    "followersCount": 300,
+                    "description": "News updates"
                 }]
             })))
             .mount(&srv)
@@ -580,6 +605,7 @@ mod tests {
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].reply_count, 42);
         assert_eq!(posts[0].text, "hello world");
+        assert_eq!(posts[0].embed_kind.as_deref(), Some("external_link"));
 
         let quotes = enricher
             .fetch_post_quotes("at://did:plc:alice/app.bsky.feed.post/1", 25)
@@ -596,6 +622,43 @@ mod tests {
             .await;
         assert_eq!(profiles.len(), 1);
         assert_eq!(profiles[0].followers_count, Some(300));
+        assert_eq!(profiles[0].description.as_deref(), Some("News updates"));
+
+        assert_eq!(
+            PublicAppViewEnricher::extract_embed_kind(Some(
+                &json!({ "embed": { "$type": "app.bsky.embed.recordWithMedia" } })
+            ))
+            .as_deref(),
+            Some("quote_with_media")
+        );
+        assert_eq!(
+            PublicAppViewEnricher::extract_embed_kind(Some(
+                &json!({ "embed": { "$type": "app.bsky.embed.images" } })
+            ))
+            .as_deref(),
+            Some("images")
+        );
+        assert_eq!(
+            PublicAppViewEnricher::extract_embed_kind(Some(
+                &json!({ "embed": { "$type": "app.bsky.embed.video" } })
+            ))
+            .as_deref(),
+            Some("video")
+        );
+        assert_eq!(
+            PublicAppViewEnricher::extract_embed_kind(Some(
+                &json!({ "embed": { "$type": "app.bsky.embed.record" } })
+            ))
+            .as_deref(),
+            Some("quote_post")
+        );
+        assert_eq!(
+            PublicAppViewEnricher::extract_embed_kind(Some(
+                &json!({ "embed": { "$type": "app.bsky.embed.unknown" } })
+            )),
+            None
+        );
+        assert_eq!(PublicAppViewEnricher::extract_embed_kind(None), None);
 
         let rels = enricher
             .fetch_relationships(

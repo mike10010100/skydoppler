@@ -89,6 +89,12 @@ pub struct StormStanceInput {
     pub target_did: String,
     /// Target handle, if known.
     pub target_handle: Option<String>,
+    /// Target display name, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_display_name: Option<String>,
+    /// Target profile bio / description, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_bio: Option<String>,
     /// Target audience tier.
     pub target_tier: TargetTier,
     /// Canonical AT-URI of the focal post.
@@ -196,6 +202,10 @@ struct OllamaMessage {
 
 #[derive(Debug, Deserialize)]
 struct OllamaStormJson {
+    #[serde(default)]
+    hostility_directed_at_author: Option<bool>,
+    #[serde(default)]
+    hostility_target: Option<String>,
     collective_hostility: bool,
     confidence: f64,
     #[serde(default)]
@@ -318,16 +328,47 @@ impl LlmStormStanceClassifier {
             .filter(|h| !h.trim().is_empty())
             .unwrap_or(&input.target_did);
 
-        let _ = writeln!(
-            out,
-            "Target: {target_label} (tier={})",
-            input.target_tier.as_str()
-        );
-        if let Some(ref fp) = input.focal_post {
-            let snippet: String = fp.text.chars().take(280).collect();
+        let display_name = input
+            .target_display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(dn) = display_name {
+            let clean_dn: String = dn.chars().take(80).collect();
             let _ = writeln!(
                 out,
-                "Focal Post ({} likes, {} reposts, {} replies, {} quotes): \"{}\"",
+                "Target Post Author: {target_label} (\"{clean_dn}\", tier={})",
+                input.target_tier.as_str()
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "Target Post Author: {target_label} (tier={})",
+                input.target_tier.as_str()
+            );
+        }
+        if let Some(ref bio) = input.target_bio {
+            let clean_bio: String = bio
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(220)
+                .collect();
+            if !clean_bio.is_empty() {
+                let _ = writeln!(out, "Target Bio: \"{clean_bio}\"");
+            }
+        }
+        if let Some(ref fp) = input.focal_post {
+            let snippet: String = fp.text.chars().take(280).collect();
+            let embed_note = fp
+                .embed_kind
+                .as_deref()
+                .map(|k| format!(", embed={k}"))
+                .unwrap_or_default();
+            let _ = writeln!(
+                out,
+                "Focal Post ({} likes, {} reposts, {} replies, {} quotes{embed_note}): \"{}\"",
                 fp.like_count, fp.repost_count, fp.reply_count, fp.quote_count, snippet
             );
         } else {
@@ -383,7 +424,7 @@ impl LlmStormStanceClassifier {
 impl StormStanceClassifier for LlmStormStanceClassifier {
     async fn classify_storm(&self, input: &StormStanceInput) -> Result<StormStanceVerdict> {
         let bundle = Self::format_bundle_prompt(input);
-        let system_prompt = "Classify the Bluesky crowd reaction into one of: dogpile, public_figure_backlash, heated_debate, benign_viral, uncertain. Set collective_hostility=true for coordinated hostile pile-ons, dunks, or backlash; set classification='benign_viral' and collective_hostility=false for Q&A participation prompts, fandom threads, jokes, or enthusiastic viral engagement. Return strict JSON.";
+        let system_prompt = "You are a Bluesky crowd-behavior analyst distinguishing TRUE dogpiles directed at the post author from outrage directed at a third-party news subject, politician, screenshot, or quoted person.\nCRITICAL DISTINCTION:\n- If the post is a news headline, breaking update, media clip, aggregator post, sarcastic commentary, or screenshot of someone else, and responders are agreeing with the poster OR mocking/attacking the THIRD-PARTY SUBJECT mentioned or shown in the post (NOT attacking the Bluesky account that posted it), then hostility_directed_at_author MUST be false, hostility_target MUST be 'third_party_subject', collective_hostility MUST be false, and classification MUST be 'third_party_news_reaction'.\n- Pay attention to engagement ratios: if the focal post has high likes relative to replies (direct_ratio < 0.5, dunk_ratio < 0.5), the crowd is largely agreeing with or supporting the author rather than dogpiling them. Q&A participation prompts and jokes are 'benign_viral'.\n- Set hostility_directed_at_author=true and hostility_target='post_author' ONLY when responders are attacking, dunking on, harassing, mocking, or scolding the Bluesky post author or outlet themselves (e.g. for their own take, conduct, or biased framing).\nReturn strict JSON.";
 
         let mut last_err: Option<SkydopplerError> = None;
         for attempt in 0..=self.config.max_retries {
@@ -400,6 +441,11 @@ impl StormStanceClassifier for LlmStormStanceClassifier {
                     "format": {
                         "type": "object",
                         "properties": {
+                            "hostility_directed_at_author": { "type": "boolean" },
+                            "hostility_target": {
+                                "type": "string",
+                                "enum": ["post_author", "third_party_subject", "none"]
+                            },
                             "collective_hostility": { "type": "boolean" },
                             "confidence": { "type": "number" },
                             "classification": {
@@ -407,6 +453,7 @@ impl StormStanceClassifier for LlmStormStanceClassifier {
                                 "enum": [
                                     "dogpile",
                                     "public_figure_backlash",
+                                    "third_party_news_reaction",
                                     "heated_debate",
                                     "benign_viral",
                                     "uncertain"
@@ -415,6 +462,8 @@ impl StormStanceClassifier for LlmStormStanceClassifier {
                             "summary": { "type": "string" }
                         },
                         "required": [
+                            "hostility_directed_at_author",
+                            "hostility_target",
                             "collective_hostility",
                             "confidence",
                             "classification",
@@ -472,14 +521,28 @@ impl StormStanceClassifier for LlmStormStanceClassifier {
                                     "Ollama JSON parse error (attempt {attempt}): {e}"
                                 ))
                             })?;
-                        let cat = Self::parse_category(
-                            parsed.classification.as_deref(),
-                            parsed.collective_hostility,
-                        );
+                        let third_party_reaction = parsed.hostility_directed_at_author
+                            == Some(false)
+                            || parsed.hostility_target.as_deref().is_some_and(|t| {
+                                t.eq_ignore_ascii_case("third_party_subject")
+                                    || t.eq_ignore_ascii_case("none")
+                            })
+                            || parsed.classification.as_deref().is_some_and(|c| {
+                                c.eq_ignore_ascii_case("third_party_news_reaction")
+                            });
+                        let (effective_hostility, effective_category) = if third_party_reaction {
+                            (false, StormCategory::BenignViral)
+                        } else {
+                            let cat = Self::parse_category(
+                                parsed.classification.as_deref(),
+                                parsed.collective_hostility,
+                            );
+                            (parsed.collective_hostility, cat)
+                        };
                         StormStanceVerdict::new(
-                            parsed.collective_hostility,
+                            effective_hostility,
                             parsed.confidence,
-                            cat,
+                            effective_category,
                             parsed.summary.unwrap_or_default(),
                             self.config.model.clone(),
                         )
@@ -569,6 +632,8 @@ mod tests {
         StormStanceInput {
             target_did: "did:plc:alice".to_string(),
             target_handle: Some("alice.bsky.social".to_string()),
+            target_display_name: Some("Alice".to_string()),
+            target_bio: Some("Indie game artist\nand coffee fan".to_string()),
             target_tier: TargetTier::Small,
             focal_post_uri: "at://did:plc:alice/app.bsky.feed.post/3k1".to_string(),
             focal_post: Some(PostEngagementSnapshot {
@@ -581,6 +646,7 @@ mod tests {
                 repost_count: 1,
                 like_count: 2,
                 quote_count: 12,
+                embed_kind: Some("images".to_string()),
             }),
             top_quotes: vec![PostEngagementSnapshot {
                 uri: "at://did:plc:big/app.bsky.feed.post/q1".to_string(),
@@ -592,6 +658,7 @@ mod tests {
                 repost_count: 40,
                 like_count: 600,
                 quote_count: 3,
+                embed_kind: None,
             }],
             sample_replies: vec![SampleReply {
                 author_did: "did:plc:r1".to_string(),
@@ -698,6 +765,30 @@ mod tests {
         let req_json: serde_json::Value = serde_json::from_slice(&ollama_reqs[0].body).unwrap();
         assert_eq!(req_json["think"], serde_json::json!(false));
         assert_eq!(req_json["format"]["type"], serde_json::json!("object"));
+        assert!(req_json["format"]["properties"]["hostility_directed_at_author"].is_object());
+        let prompt_str = LlmStormStanceClassifier::format_bundle_prompt(&sample_input());
+        assert!(prompt_str.contains("Target Bio: \"Indie game artist and coffee fan\""));
+        assert!(prompt_str.contains("embed=images"));
+
+        // Third-party news/subject outrage deterministically normalizes to BenignViral + non-hostile
+        let news_ollama = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/chat"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "message": {
+                    "content": "{\"hostility_directed_at_author\": false, \"hostility_target\": \"third_party_subject\", \"collective_hostility\": true, \"confidence\": 0.95, \"classification\": \"third_party_news_reaction\", \"summary\": \"Mocking the news subject, not the outlet.\"}"
+                }
+            })))
+            .mount(&news_ollama)
+            .await;
+        let news_ol = LlmStormStanceClassifier::new(StanceConfig {
+            base_url: format!("{}/api/chat", news_ollama.uri()),
+            ..Default::default()
+        })
+        .unwrap();
+        let nv = news_ol.classify_storm(&sample_input()).await.unwrap();
+        assert!(!nv.collective_hostility);
+        assert_eq!(nv.category, StormCategory::BenignViral);
 
         // SystemOne live mock + missing answer error
         let sys = MockServer::start().await;
@@ -777,6 +868,8 @@ mod tests {
         let minimal = LlmStormStanceClassifier::format_bundle_prompt(&StormStanceInput {
             target_did: "did:plc:x".to_string(),
             target_handle: None,
+            target_display_name: None,
+            target_bio: None,
             target_tier: TargetTier::Unknown,
             focal_post_uri: "at://did:plc:x/app.bsky.feed.post/1".to_string(),
             focal_post: None,

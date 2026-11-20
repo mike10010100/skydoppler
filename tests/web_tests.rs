@@ -36,6 +36,7 @@ fn setup_test_engine() -> Arc<SkydopplerEngine> {
         repost_count: 0,
         like_count: 2,
         quote_count: 8,
+        ..Default::default()
     });
     enricher.set_profile(ActorSummary {
         did: "did:plc:small123".to_string(),
@@ -53,6 +54,7 @@ fn setup_test_engine() -> Arc<SkydopplerEngine> {
         repost_count: 50,
         like_count: 1_100,
         quote_count: 2,
+        ..Default::default()
     });
 
     // 2. Public figure (>= 5,000 followers)
@@ -67,6 +69,7 @@ fn setup_test_engine() -> Arc<SkydopplerEngine> {
         repost_count: 5,
         like_count: 12,
         quote_count: 25,
+        ..Default::default()
     });
     enricher.set_profile(ActorSummary {
         did: "did:plc:public777".to_string(),
