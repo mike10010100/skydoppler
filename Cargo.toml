@@ -1,0 +1,94 @@
+[package]
+name = "skydoppler"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+authors = ["Michael Paulauski <mike10010100@gmail.com>"]
+description = "Network-Wide Bluesky Atmospheric Dogpile Radar & Real-Time Crowd Surge Observatory"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/mike10010100/skydoppler"
+homepage = "https://github.com/mike10010100/skydoppler"
+documentation = "https://docs.rs/skydoppler"
+keywords = ["atproto", "bluesky", "radar", "jetstream", "analytics"]
+categories = ["web-programming", "asynchronous", "network-programming"]
+readme = "README.md"
+
+[lib]
+name = "skydoppler"
+path = "src/lib.rs"
+
+[[bin]]
+name = "skydoppler"
+path = "src/main.rs"
+required-features = ["web", "stream", "storage", "telemetry"]
+
+[[example]]
+name = "live_radar_soak"
+path = "examples/live_radar_soak.rs"
+required-features = ["web", "stream", "storage", "telemetry"]
+
+[features]
+default = ["web", "stream", "storage", "telemetry"]
+# Axum HTTP API, SSE push stream, and animated Doppler Radar dashboard.
+web = ["dep:axum", "dep:tower-http", "dep:futures-util"]
+# Live Jetstream WebSocket firehose streaming consumer.
+stream = ["dep:tokio-tungstenite", "dep:futures-util"]
+# Embedded SQLite WAL persistence for detected storms and weather history.
+storage = ["dep:rusqlite"]
+# `tracing-subscriber` logging initializer for binaries and examples.
+telemetry = ["dep:tracing-subscriber"]
+
+[dependencies]
+# AT Protocol primitives, Jetstream ingest & AppView client from crates.io.
+skybase = { version = "0.1.11", default-features = false }
+
+# HTTP Web Framework & Async Streams
+axum = { version = "0.8", optional = true, default-features = false, features = ["json", "query", "tokio", "macros", "http1"] }
+tower-http = { version = "0.6", optional = true, default-features = false, features = ["cors", "trace"] }
+futures-util = { version = "0.3", optional = true, features = ["sink"] }
+
+# Concurrency & Async Runtime
+tokio = { version = "1.53.3", default-features = false, features = ["rt-multi-thread", "net", "time", "sync", "macros", "signal"] }
+tokio-util = "0.7"
+async-trait = "0.1"
+parking_lot = "0.12"
+
+# Embedded Database & Persistence
+rusqlite = { version = "0.41", optional = true, features = ["bundled"] }
+
+# Serialization & JSON
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Cryptography & Constant-Time Auth
+subtle = "2.6"
+
+# Networking & HTTP (strictly pure Rustls, zero OpenSSL)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls-webpki = { version = "0.103.16", default-features = false, features = ["std", "ring"] }
+webpki-roots = "1.0.10"
+url = { version = "2.5", features = ["serde"] }
+
+# WebSocket Stream Ingestion
+tokio-tungstenite = { version = "0.30", optional = true, features = ["rustls-tls-native-roots"] }
+
+# Error Handling & Observability
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", optional = true, default-features = false, features = ["env-filter", "fmt", "ansi"] }
+
+[dev-dependencies]
+tokio = { version = "1.53.3", features = ["full", "test-util"] }
+tower = { version = "0.5", default-features = false, features = ["util"] }
+wiremock = "0.6"
+tempfile = "3"
+proptest = "1.5"
+futures-util = "0.3"
+serde_urlencoded = "0.7"
+
+# Keep third-party crates at opt-level = 1 in dev/test while compiling crate targets fast.
+[profile.dev.package."*"]
+opt-level = 1
+
+[profile.test.package."*"]
+opt-level = 1
