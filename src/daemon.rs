@@ -12,7 +12,7 @@ use tracing::{error, info, warn};
 
 use crate::engine::{EngineStatsSnapshot, SkydopplerEngine, SkydopplerEngineBuilder};
 use crate::error::{Result, SkydopplerError};
-use crate::stance::{LlmStormStanceClassifier, StanceConfig};
+use crate::stance::{LlmStormStanceClassifier, StanceConfig, StormStanceClassifier};
 use crate::storage::StormStore;
 use crate::stream::{
     resolve_resume_cursor, run_jetstream_streamer, StreamConfig, DEFAULT_JETSTREAM_ENDPOINT,
@@ -107,6 +107,7 @@ pub fn build_engine_from_config(cfg: &DaemonConfig) -> Result<Arc<SkydopplerEngi
             Ok(classifier) => {
                 info!(
                     endpoint = %classifier.endpoint_url(),
+                    model = %classifier.model_name(),
                     "Stage 3 bundled LLM stance verifier enabled"
                 );
                 builder = builder.with_stance_classifier(Arc::new(classifier));

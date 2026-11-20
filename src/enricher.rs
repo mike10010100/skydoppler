@@ -1,4 +1,4 @@
-//! Polite rate-limited AppView enrichment (`getPosts`, `getProfiles`, `getRelationships`).
+//! Polite rate-limited AppView enrichment (`getPosts`, `getQuotes`, `getProfiles`, `getRelationships`).
 //!
 //! Fetches batched focal/catalyst post metrics, target & catalyst follower counts, and exact
 //! pairwise out-of-network follow status for Stage 2 surge verification without holding a
@@ -34,6 +34,15 @@ pub trait NetworkEnricher: Send + Sync {
         target_did: &str,
         others: &[String],
     ) -> Vec<RelationshipStatus>;
+
+    /// Fetches recent quote-posts referencing `focal_post_uri` via `app.bsky.feed.getQuotes`.
+    async fn fetch_post_quotes(
+        &self,
+        _focal_post_uri: &str,
+        _limit: usize,
+    ) -> Vec<PostEngagementSnapshot> {
+        Vec::new()
+    }
 }
 
 /// No-op enricher returning empty vectors (useful when operating strictly offline).
@@ -63,6 +72,7 @@ impl NetworkEnricher for NoopNetworkEnricher {
 #[derive(Debug, Default, Clone)]
 pub struct MockNetworkEnricher {
     posts: Arc<RwLock<HashMap<String, PostEngagementSnapshot>>>,
+    quotes: Arc<RwLock<HashMap<String, Vec<PostEngagementSnapshot>>>>,
     profiles: Arc<RwLock<HashMap<String, ActorSummary>>>,
     relationships: Arc<RwLock<HashMap<(String, String), RelationshipStatus>>>,
 }
@@ -77,6 +87,15 @@ impl MockNetworkEnricher {
     /// Inserts or replaces a mock post engagement snapshot.
     pub fn set_post(&self, snapshot: PostEngagementSnapshot) {
         self.posts.write().insert(snapshot.uri.clone(), snapshot);
+    }
+
+    /// Inserts or replaces mock quote-posts returned by [`Self::fetch_post_quotes`] for `focal_post_uri`.
+    pub fn set_quotes(
+        &self,
+        focal_post_uri: impl Into<String>,
+        quotes: Vec<PostEngagementSnapshot>,
+    ) {
+        self.quotes.write().insert(focal_post_uri.into(), quotes);
     }
 
     /// Inserts or replaces a mock actor profile summary.
@@ -137,6 +156,23 @@ impl NetworkEnricher for MockNetworkEnricher {
                     })
             })
             .collect()
+    }
+
+    async fn fetch_post_quotes(
+        &self,
+        focal_post_uri: &str,
+        limit: usize,
+    ) -> Vec<PostEngagementSnapshot> {
+        let guard = self.quotes.read();
+        guard
+            .get(focal_post_uri)
+            .map(|list| {
+                list.iter()
+                    .take(limit.min(MAX_POSTS_PER_BATCH))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -241,6 +277,30 @@ impl PublicAppViewEnricher {
             tokio::time::sleep(wait_dur).await;
         }
     }
+
+    fn map_post_view(p: GetPostsView) -> PostEngagementSnapshot {
+        let author_did = p.author.as_ref().map(|a| a.did.clone()).unwrap_or_default();
+        let author_handle = p.author.as_ref().and_then(|a| a.handle.clone());
+        let author_followers = p.author.as_ref().and_then(|a| a.followers_count);
+        let text = p
+            .record
+            .as_ref()
+            .and_then(|r| r.get("text"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        PostEngagementSnapshot {
+            uri: p.uri,
+            author_did,
+            author_handle,
+            author_followers,
+            text,
+            reply_count: p.reply_count.unwrap_or(0),
+            repost_count: p.repost_count.unwrap_or(0),
+            like_count: p.like_count.unwrap_or(0),
+            quote_count: p.quote_count.unwrap_or(0),
+        }
+    }
 }
 
 #[async_trait]
@@ -264,32 +324,35 @@ impl NetworkEnricher for PublicAppViewEnricher {
                 .get::<GetPostsResponse>("app.bsky.feed.getPosts", &query)
                 .await
             {
-                for p in resp.posts {
-                    let author_did = p.author.as_ref().map(|a| a.did.clone()).unwrap_or_default();
-                    let author_handle = p.author.as_ref().and_then(|a| a.handle.clone());
-                    let author_followers = p.author.as_ref().and_then(|a| a.followers_count);
-                    let text = p
-                        .record
-                        .as_ref()
-                        .and_then(|r| r.get("text"))
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    out.push(PostEngagementSnapshot {
-                        uri: p.uri,
-                        author_did,
-                        author_handle,
-                        author_followers,
-                        text,
-                        reply_count: p.reply_count.unwrap_or(0),
-                        repost_count: p.repost_count.unwrap_or(0),
-                        like_count: p.like_count.unwrap_or(0),
-                        quote_count: p.quote_count.unwrap_or(0),
-                    });
-                }
+                out.extend(resp.posts.into_iter().map(Self::map_post_view));
             }
         }
         out
+    }
+
+    async fn fetch_post_quotes(
+        &self,
+        focal_post_uri: &str,
+        limit: usize,
+    ) -> Vec<PostEngagementSnapshot> {
+        let clean_uri = focal_post_uri.trim();
+        if !clean_uri.starts_with("at://") {
+            return Vec::new();
+        }
+        let clamped_limit = limit.clamp(1, MAX_POSTS_PER_BATCH);
+        let query = vec![
+            ("uri", clean_uri.to_string()),
+            ("limit", clamped_limit.to_string()),
+        ];
+        self.wait_rate_slot().await;
+        match self
+            .client
+            .get::<GetPostsResponse>("app.bsky.feed.getQuotes", &query)
+            .await
+        {
+            Ok(resp) => resp.posts.into_iter().map(Self::map_post_view).collect(),
+            Err(_) => Vec::new(),
+        }
     }
 
     async fn fetch_actor_profiles(&self, dids: &[String]) -> Vec<ActorSummary> {
@@ -385,6 +448,10 @@ mod tests {
     async fn noop_and_mock_enrichers_work() {
         let noop = NoopNetworkEnricher;
         assert!(noop.fetch_post_engagements(&[]).await.is_empty());
+        assert!(noop
+            .fetch_post_quotes("at://did:plc:alice/app.bsky.feed.post/1", 10)
+            .await
+            .is_empty());
         assert!(noop.fetch_actor_profiles(&[]).await.is_empty());
         assert!(noop.fetch_relationships("a", &[]).await.is_empty());
 
@@ -396,6 +463,15 @@ mod tests {
             reply_count: 40,
             ..Default::default()
         });
+        mock.set_quotes(
+            "at://did:plc:alice/app.bsky.feed.post/1",
+            vec![PostEngagementSnapshot {
+                uri: "at://did:plc:qt/app.bsky.feed.post/2".to_string(),
+                author_did: "did:plc:qt".to_string(),
+                like_count: 250,
+                ..Default::default()
+            }],
+        );
         mock.set_profile(ActorSummary {
             did: "did:plc:alice".to_string(),
             handle: Some("alice.bsky.social".to_string()),
@@ -406,6 +482,12 @@ mod tests {
 
         assert_eq!(
             mock.fetch_post_engagements(&["at://did:plc:alice/app.bsky.feed.post/1".to_string()])
+                .await
+                .len(),
+            1
+        );
+        assert_eq!(
+            mock.fetch_post_quotes("at://did:plc:alice/app.bsky.feed.post/1", 10)
                 .await
                 .len(),
             1
@@ -472,6 +554,22 @@ mod tests {
             .mount(&srv)
             .await;
 
+        Mock::given(method("GET"))
+            .and(path("/xrpc/app.bsky.feed.getQuotes"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "posts": [{
+                    "uri": "at://did:plc:big/app.bsky.feed.post/qt99",
+                    "author": { "did": "did:plc:big", "handle": "big.bsky.social", "followersCount": 50000 },
+                    "record": { "text": "Dunk quote" },
+                    "replyCount": 12,
+                    "repostCount": 40,
+                    "likeCount": 600,
+                    "quoteCount": 3
+                }]
+            })))
+            .mount(&srv)
+            .await;
+
         let enricher = PublicAppViewEnricher::new(srv.uri(), 40.0);
         let posts = enricher
             .fetch_post_engagements(&[
@@ -482,6 +580,16 @@ mod tests {
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].reply_count, 42);
         assert_eq!(posts[0].text, "hello world");
+
+        let quotes = enricher
+            .fetch_post_quotes("at://did:plc:alice/app.bsky.feed.post/1", 25)
+            .await;
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].like_count, 600);
+        assert!(enricher
+            .fetch_post_quotes("not-at-uri", 10)
+            .await
+            .is_empty());
 
         let profiles = enricher
             .fetch_actor_profiles(&["did:plc:alice".to_string()])

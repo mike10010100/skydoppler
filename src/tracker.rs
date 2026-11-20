@@ -53,6 +53,7 @@ struct PostBucket {
     live_likes: VecDeque<u64>,
     live_reposts: VecDeque<u64>,
     last_emitted_us: Option<u64>,
+    last_emitted_authors: usize,
 }
 
 impl PostBucket {
@@ -68,6 +69,7 @@ impl PostBucket {
             live_likes: VecDeque::new(),
             live_reposts: VecDeque::new(),
             last_emitted_us: None,
+            last_emitted_authors: 0,
         }
     }
 
@@ -336,7 +338,8 @@ impl NetworkTracker {
             .trim()
             .to_string();
 
-        // Extract reply target (prefer root post authored by target, else parent) and quote target.
+        // Extract reply target (prefer direct parent so subthread dogpiles target the replied-to post,
+        // falling back to root if parent is omitted) and quote target.
         let reply_obj = record.get("reply");
         let root_uri = reply_obj
             .and_then(|r| r.get("root"))
@@ -360,13 +363,9 @@ impl NetworkTracker {
         let (focal_post_uri, kind) = if let Some(q_uri) = quote_uri {
             (q_uri, InteractionKind::Quote)
         } else if let Some(p_uri) = parent_uri {
-            let target_uri = match root_uri {
-                Some(r_uri) if r_uri != commit.did => r_uri,
-                _ => p_uri,
-            };
-            // If parent is also a post by a different author than root, track parent if same or root.
-            let _ = p_uri;
-            (target_uri, InteractionKind::Reply)
+            (p_uri, InteractionKind::Reply)
+        } else if let Some(r_uri) = root_uri {
+            (r_uri, InteractionKind::Reply)
         } else {
             return ObserveOutcome::Ignored;
         };
@@ -751,11 +750,15 @@ impl NetworkTracker {
         }
 
         if let Some(last) = bucket.last_emitted_us {
-            if now_us.saturating_sub(last) < cooldown_us {
+            let within_cooldown = now_us.saturating_sub(last) < cooldown_us;
+            let doubled_authors = bucket.last_emitted_authors > 0
+                && unique_authors >= bucket.last_emitted_authors.saturating_mul(2);
+            if within_cooldown && !doubled_authors {
                 return None;
             }
         }
         bucket.last_emitted_us = Some(now_us);
+        bucket.last_emitted_authors = unique_authors;
 
         let metrics = StormMetrics {
             unique_authors_short: unique_authors,
@@ -953,18 +956,35 @@ mod tests {
         let cand = triggered.expect("Stage 1 should trigger");
         assert_eq!(cand.target_did, "did:plc:bob");
         assert_eq!(cand.recent_quote_uris.len(), 1);
+        assert_eq!(cand.initial_metrics.unique_authors_short, 4);
 
-        // Cooldown prevents immediate re-trigger on next reply
-        assert_eq!(
-            tracker.observe_commit(&mk_reply(
-                "did:plc:o9",
-                "did:plc:bob",
-                "3khot",
-                10_000_500,
-                "more"
-            )),
-            ObserveOutcome::PostInteraction(None)
-        );
+        // Cooldown prevents immediate re-trigger while authors < 2x (4 -> 5, 6, 7)
+        for idx in 9..=10 {
+            assert_eq!(
+                tracker.observe_commit(&mk_reply(
+                    &format!("did:plc:o{idx}"),
+                    "did:plc:bob",
+                    "3khot",
+                    10_000_500 + idx,
+                    "more"
+                )),
+                ObserveOutcome::PostInteraction(None)
+            );
+        }
+        // Reaching 2x unique authors (8 >= 4 * 2) bypasses enrich_cooldown for escalating storms
+        let escalated = tracker.observe_commit(&mk_reply(
+            "did:plc:o11",
+            "did:plc:bob",
+            "3khot",
+            10_000_520,
+            "escalating",
+        ));
+        match escalated {
+            ObserveOutcome::PostInteraction(Some(c2)) => {
+                assert_eq!(c2.initial_metrics.unique_authors_short, 8);
+            }
+            other => panic!("expected 2x author escalation bypass, got {other:?}"),
+        }
 
         // Defensive block + deduped postgate + threadgate lower threshold for alice
         let _ = tracker.observe_commit(&mk_reply(
@@ -1019,5 +1039,45 @@ mod tests {
         assert!(tracker.snapshot().tracked_posts <= 64);
         assert!(tracker.prune_stale(500_000_000) > 0);
         assert_eq!(tracker.snapshot().tracked_posts, 0);
+    }
+
+    #[test]
+    fn subthread_reply_targets_parent_post_not_thread_root() {
+        let tracker = NetworkTracker::new(
+            RadarConfig::default()
+                .with_min_unique_authors(2)
+                .with_thresholds(0.10, 0.50, 0.60),
+        );
+        let root_uri = "at://did:plc:threadop/app.bsky.feed.post/3kroot";
+        let parent_uri = "at://did:plc:subreply/app.bsky.feed.post/3ksub";
+
+        let mut last = ObserveOutcome::Ignored;
+        for idx in 1..=2 {
+            let commit = JetstreamCommit {
+                did: format!("did:plc:dogpiler{idx}"),
+                time_us: 100_000 + idx,
+                collection: "app.bsky.feed.post".to_string(),
+                rkey: format!("sr{idx}"),
+                operation: CommitOperation::Create,
+                cid: Some("cid".to_string()),
+                record: Some(json!({
+                    "$type": "app.bsky.feed.post",
+                    "text": "Replying directly to the subthread comment",
+                    "reply": {
+                        "root": { "uri": root_uri, "cid": "croot" },
+                        "parent": { "uri": parent_uri, "cid": "cparent" }
+                    }
+                })),
+            };
+            last = tracker.observe_commit(&commit);
+        }
+
+        match last {
+            ObserveOutcome::PostInteraction(Some(cand)) => {
+                assert_eq!(cand.focal_post_uri, parent_uri);
+                assert_eq!(cand.target_did, "did:plc:subreply");
+            }
+            other => panic!("expected subthread parent candidate, got {other:?}"),
+        }
     }
 }

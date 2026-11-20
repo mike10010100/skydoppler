@@ -106,6 +106,10 @@ impl Respond for AppViewRouterMock {
             }));
         }
 
+        if p == "/xrpc/app.bsky.feed.getQuotes" {
+            return ResponseTemplate::new(200).set_body_json(json!({ "posts": [] }));
+        }
+
         ResponseTemplate::new(404)
     }
 }
