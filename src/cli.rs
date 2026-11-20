@@ -495,7 +495,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(String::from_utf8(buf).unwrap().contains("skydoppler 0.1.0"));
+        assert!(String::from_utf8(buf)
+            .unwrap()
+            .contains(concat!("skydoppler ", env!("CARGO_PKG_VERSION"))));
 
         let mut buf = Vec::new();
         dispatch_to_writer(

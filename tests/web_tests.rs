@@ -186,6 +186,8 @@ async fn dashboard_health_metrics_weather_redaction_operator_auth_and_dismiss() 
     assert!(html.contains("doppler-canvas"));
     assert!(html.contains("escapeHtml"));
     assert!(html.contains("Protected Small Account"));
+    assert!(html.contains("encodeBskyActor"));
+    assert!(html.contains("replace(/%3A/gi, ':')"));
 
     // 2. Health & Metrics
     for path in ["/healthz", "/api/v1/health"] {
