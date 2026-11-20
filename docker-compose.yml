@@ -1,0 +1,54 @@
+# ==============================================================================
+# Docker Compose Configuration for SkyDoppler
+# Network-Wide Bluesky Atmospheric Dogpile Radar
+# ==============================================================================
+
+services:
+  skydoppler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: skydoppler:${IMAGE_TAG:-latest}
+    container_name: skydoppler
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports:
+      - "${PORT_BIND:-3032}:3000"
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3000
+      - SKYDOPPLER_DATABASE_PATH=/data/skydoppler.db
+      - SKYDOPPLER_OPERATOR_TOKEN=${SKYDOPPLER_OPERATOR_TOKEN:-}
+      - RUST_LOG=${RUST_LOG:-info,skydoppler=info,skybase=info}
+    stop_grace_period: 30s
+    volumes:
+      - skydoppler_data:/data:rw
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    deploy:
+      resources:
+        limits:
+          memory: ${MEM_LIMIT:-1024M}
+        reservations:
+          memory: 128M
+    networks:
+      - skydoppler_net
+
+volumes:
+  skydoppler_data:
+    name: skydoppler_data
+
+networks:
+  skydoppler_net:
+    name: skydoppler_net
+    driver: bridge
