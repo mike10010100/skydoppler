@@ -17,7 +17,7 @@ pub const DEFAULT_MIN_UNIQUE_AUTHORS: usize = 8;
 /// Default minimum streaming replies+quotes / (likes+reposts+replies+quotes) ratio trigger.
 pub const DEFAULT_MIN_STREAMING_RATIO: f64 = 0.50;
 /// Default hard cap on concurrently tracked hot posts across all shards.
-pub const DEFAULT_MAX_TRACKED_POSTS: usize = 20_000;
+pub const DEFAULT_MAX_TRACKED_POSTS: usize = 40_000;
 /// Default hard cap on concurrently tracked target authors for defensive distress bursts.
 pub const DEFAULT_MAX_TRACKED_AUTHORS: usize = 20_000;
 /// Default follower threshold below which (or when unknown) public storm targets are redacted.
@@ -77,12 +77,12 @@ impl Default for RadarConfig {
             max_tracked_posts: DEFAULT_MAX_TRACKED_POSTS,
             max_tracked_authors: DEFAULT_MAX_TRACKED_AUTHORS,
             max_sample_replies: 20,
-            enrich_cooldown: Duration::from_secs(600),
+            enrich_cooldown: Duration::from_secs(120),
             storm_ttl: Duration::from_secs(1800),
             history_retention: Duration::from_secs(604_800),
-            stage1_trigger_score: 0.40,
-            confirmed_score_threshold: 0.62,
-            structural_fallback_threshold: 0.68,
+            stage1_trigger_score: 0.35,
+            confirmed_score_threshold: 0.56,
+            structural_fallback_threshold: 0.65,
             public_follower_threshold: DEFAULT_PUBLIC_FOLLOWER_THRESHOLD,
             enable_llm_stance: false,
             eval_queue_capacity: 512,

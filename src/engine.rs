@@ -32,6 +32,12 @@ use crate::types::{
 };
 
 const STATS_META_KEY: &str = "engine_stats_v1";
+const MIN_CATALYST_ENGAGEMENT: u64 = 5;
+const MIN_STANCE_STRUCTURAL_SCORE: f64 = 0.30;
+const MIN_STANCE_OON_RATIO: f64 = 0.25;
+const MIN_STANCE_DIRECT_RATIO: f64 = 0.25;
+const MIN_STANCE_DUNK_RATIO: f64 = 1.0;
+const BENIGN_VIRAL_VETO_CONFIDENCE: f64 = 0.70;
 
 /// Thread-safe atomic counters tracking firehose throughput and radar detections.
 #[derive(Debug, Default)]
@@ -475,6 +481,21 @@ impl SkydopplerEngine {
                 quote_snaps.push(p);
             }
         }
+        if focal_post.as_ref().is_some_and(|f| f.quote_count > 0)
+            || !candidate.recent_quote_uris.is_empty()
+        {
+            let fetched_quotes = self
+                .enricher
+                .fetch_post_quotes(&candidate.focal_post_uri, 25)
+                .await;
+            for qt in fetched_quotes {
+                if qt.uri != candidate.focal_post_uri
+                    && !quote_snaps.iter().any(|existing| existing.uri == qt.uri)
+                {
+                    quote_snaps.push(qt);
+                }
+            }
+        }
         quote_snaps.sort_by(|a, b| {
             let sa = a
                 .like_count
@@ -485,9 +506,12 @@ impl SkydopplerEngine {
             sb.cmp(&sa)
         });
 
-        // 2. Batched getProfiles (target + top catalyst authors)
+        // 2. Batched getProfiles (target + top engaged catalyst author)
+        let engaged_top_qt = quote_snaps
+            .first()
+            .filter(|qt| qt.like_count.saturating_add(qt.repost_count) >= MIN_CATALYST_ENGAGEMENT);
         let mut profile_dids = vec![candidate.target_did.clone()];
-        if let Some(top_qt) = quote_snaps.first() {
+        if let Some(top_qt) = engaged_top_qt {
             if !top_qt.author_did.is_empty() && !profile_dids.contains(&top_qt.author_did) {
                 profile_dids.push(top_qt.author_did.clone());
             }
@@ -533,7 +557,7 @@ impl SkydopplerEngine {
         }
 
         let root_likes = focal_post.as_ref().map_or(0, |f| f.like_count);
-        let top_catalyst = if let Some(top_qt) = quote_snaps.first() {
+        let top_catalyst = if let Some(top_qt) = engaged_top_qt {
             let cat_followers = profiles
                 .iter()
                 .find(|p| p.did == top_qt.author_did)
@@ -555,6 +579,8 @@ impl SkydopplerEngine {
                 text_snippet: top_qt.text.chars().take(180).collect(),
             })
         } else {
+            metrics.dunk_ratio = 0.0;
+            metrics.power_asymmetry = 1.0;
             None
         };
 
@@ -574,8 +600,16 @@ impl SkydopplerEngine {
             target_tier,
         );
 
+        let has_distress = distress_total >= self.config.defensive_distress_threshold;
+        let has_hostile_signal = metrics.direct_ratio >= MIN_STANCE_DIRECT_RATIO
+            || metrics.dunk_ratio >= MIN_STANCE_DUNK_RATIO
+            || has_distress;
+        let qualifies_for_stance = metrics.structural_score >= MIN_STANCE_STRUCTURAL_SCORE
+            && (metrics.out_of_network_ratio >= MIN_STANCE_OON_RATIO || has_distress)
+            && has_hostile_signal;
+
         // 4. Optional Stage 3 bundled LLM stance check
-        let stance = if self.config.enable_llm_stance {
+        let stance = if self.config.enable_llm_stance && qualifies_for_stance {
             self.stats
                 .stage3_stance_calls
                 .fetch_add(1, Ordering::Relaxed);
@@ -612,7 +646,15 @@ impl SkydopplerEngine {
         metrics.composite_score =
             compute_composite_score(metrics.structural_score, stance.as_ref());
 
-        let confirmed = if used_llm {
+        let llm_benign_veto = used_llm
+            && stance.as_ref().is_some_and(|s| {
+                !s.collective_hostility
+                    && s.category == StormCategory::BenignViral
+                    && s.confidence >= BENIGN_VIRAL_VETO_CONFIDENCE
+            });
+        let confirmed = if llm_benign_veto {
+            false
+        } else if used_llm {
             metrics.composite_score >= self.config.confirmed_score_threshold
         } else {
             metrics.structural_score >= self.config.structural_fallback_threshold
@@ -987,5 +1029,227 @@ mod tests {
 
         assert!(engine.dismiss_storm(storm.id).unwrap());
         assert!(!engine.dismiss_storm(999_999).unwrap());
+    }
+
+    #[tokio::test]
+    async fn engine_discovers_getquotes_gates_zero_like_catalysts_prefilters_and_vetoes_benign_viral(
+    ) {
+        let enricher = Arc::new(MockNetworkEnricher::new());
+        let focal_uri = "at://did:plc:qa/app.bsky.feed.post/3kqa";
+        let zero_qt_uri = "at://did:plc:bigreply/app.bsky.feed.post/3k0qt";
+        let viral_dunk_uri = "at://did:plc:dunker/app.bsky.feed.post/3kdunk";
+
+        enricher.set_post(PostEngagementSnapshot {
+            uri: focal_uri.to_string(),
+            author_did: "did:plc:qa".to_string(),
+            author_handle: Some("qa.bsky.social".to_string()),
+            author_followers: Some(1_000),
+            text: "20. What is your most mundane celebrity encounter?".to_string(),
+            reply_count: 60,
+            repost_count: 5,
+            like_count: 35,
+            quote_count: 18,
+        });
+        enricher.set_post(PostEngagementSnapshot {
+            uri: zero_qt_uri.to_string(),
+            author_did: "did:plc:bigreply".to_string(),
+            author_handle: Some("bigreply.bsky.social".to_string()),
+            author_followers: Some(40_000),
+            text: "Keanu in a coffee shop line".to_string(),
+            reply_count: 0,
+            repost_count: 0,
+            like_count: 0,
+            quote_count: 0,
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:qa".to_string(),
+            handle: Some("qa.bsky.social".to_string()),
+            followers_count: Some(1_000),
+            ..Default::default()
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:bigreply".to_string(),
+            handle: Some("bigreply.bsky.social".to_string()),
+            followers_count: Some(40_000),
+            ..Default::default()
+        });
+
+        let stance = Arc::new(MockStormStanceClassifier::new(StormStanceVerdict::new(
+            false,
+            0.96,
+            StormCategory::BenignViral,
+            "Benign Q&A participation thread",
+            "mock-stance",
+        )));
+
+        let cfg_fallback = RadarConfig::default()
+            .with_min_unique_authors(4)
+            .with_enable_llm_stance(false);
+        let engine_no_llm = SkydopplerEngineBuilder::new(cfg_fallback)
+            .with_enricher(enricher.clone())
+            .build()
+            .unwrap();
+
+        // Zero-like quote must NOT become top_catalyst, inflate power_asymmetry, or trip 0.65 threshold.
+        let mk_cand = || NetworkSurgeCandidate {
+            target_did: "did:plc:qa".to_string(),
+            focal_post_uri: focal_uri.to_string(),
+            observed_at_us: current_time_us(),
+            initial_metrics: StormMetrics {
+                unique_authors_short: 10,
+                unique_oon_authors_short: 10,
+                burst_z_score: 1.0,
+                ..Default::default()
+            },
+            sample_replies: vec![SampleReply {
+                author_did: "did:plc:stranger1".to_string(),
+                kind: InteractionKind::Reply,
+                post_uri: "at://did:plc:stranger1/app.bsky.feed.post/1".to_string(),
+                text_snippet: "I saw Danny DeVito once".to_string(),
+            }],
+            recent_quote_uris: vec![zero_qt_uri.to_string()],
+        };
+
+        let without_catalyst = engine_no_llm.evaluate_candidate(mk_cand()).await.unwrap();
+        assert!(without_catalyst.is_none());
+
+        // Even with a permissive fallback threshold, verify 0-like quote leaves catalyst=None & asym=1.0.
+        let cfg_permissive = RadarConfig::default()
+            .with_min_unique_authors(4)
+            .with_enable_llm_stance(false)
+            .with_thresholds(0.35, 0.56, 0.50);
+        let engine_permissive = SkydopplerEngineBuilder::new(cfg_permissive)
+            .with_enricher(enricher.clone())
+            .build()
+            .unwrap();
+        let zero_gated = engine_permissive
+            .evaluate_candidate(mk_cand())
+            .await
+            .unwrap()
+            .expect("permissive threshold confirms to inspect metrics");
+        assert!(zero_gated.top_catalyst.is_none());
+        assert!((zero_gated.metrics.power_asymmetry - 1.0).abs() < 1e-9);
+        assert!((zero_gated.metrics.dunk_ratio - 0.0).abs() < 1e-9);
+
+        // Now getQuotes returns an earlier engaged dunk quote (even when recent_quote_uris is empty) -> discovers catalyst!
+        let dunk_focal = "at://did:plc:dunked/app.bsky.feed.post/3kfocal";
+        enricher.set_post(PostEngagementSnapshot {
+            uri: dunk_focal.to_string(),
+            author_did: "did:plc:dunked".to_string(),
+            author_handle: Some("dunked.bsky.social".to_string()),
+            author_followers: Some(300),
+            text: "Bad take".to_string(),
+            reply_count: 35,
+            repost_count: 1,
+            like_count: 2,
+            quote_count: 15,
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:dunked".to_string(),
+            handle: Some("dunked.bsky.social".to_string()),
+            followers_count: Some(300),
+            ..Default::default()
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:dunker".to_string(),
+            handle: Some("dunker.bsky.social".to_string()),
+            followers_count: Some(120_000),
+            ..Default::default()
+        });
+        enricher.set_quotes(
+            dunk_focal,
+            vec![PostEngagementSnapshot {
+                uri: viral_dunk_uri.to_string(),
+                author_did: "did:plc:dunker".to_string(),
+                author_handle: Some("dunker.bsky.social".to_string()),
+                author_followers: Some(120_000),
+                text: "Worst post today".to_string(),
+                reply_count: 12,
+                repost_count: 80,
+                like_count: 900,
+                quote_count: 4,
+            }],
+        );
+        let dunk_cand = NetworkSurgeCandidate {
+            target_did: "did:plc:dunked".to_string(),
+            focal_post_uri: dunk_focal.to_string(),
+            observed_at_us: current_time_us(),
+            initial_metrics: StormMetrics {
+                unique_authors_short: 20,
+                unique_oon_authors_short: 20,
+                burst_z_score: 8.0,
+                ..Default::default()
+            },
+            sample_replies: vec![SampleReply {
+                author_did: "did:plc:stranger1".to_string(),
+                kind: InteractionKind::Reply,
+                post_uri: "at://did:plc:stranger1/app.bsky.feed.post/2".to_string(),
+                text_snippet: "Ratioed".to_string(),
+            }],
+            recent_quote_uris: vec![],
+        };
+        let discovered = engine_no_llm
+            .evaluate_candidate(dunk_cand)
+            .await
+            .unwrap()
+            .expect("getQuotes catalyst should confirm structural storm");
+        assert_eq!(
+            discovered.top_catalyst.as_ref().unwrap().post_uri,
+            viral_dunk_uri
+        );
+
+        // Stage 3 pre-filter skips mutual-friend threads without invoking LLM.
+        let cfg_llm = RadarConfig::default()
+            .with_min_unique_authors(4)
+            .with_enable_llm_stance(true)
+            .with_thresholds(0.35, 0.56, 0.65);
+        let engine_llm = SkydopplerEngineBuilder::new(cfg_llm)
+            .with_enricher(enricher.clone())
+            .with_stance_classifier(stance.clone())
+            .build()
+            .unwrap();
+
+        enricher.set_relationship("did:plc:qa", "did:plc:friend1", true, true);
+        let mutual_cand = NetworkSurgeCandidate {
+            sample_replies: vec![SampleReply {
+                author_did: "did:plc:friend1".to_string(),
+                kind: InteractionKind::Reply,
+                post_uri: "at://did:plc:friend1/app.bsky.feed.post/1".to_string(),
+                text_snippet: "haha".to_string(),
+            }],
+            ..mk_cand()
+        };
+        assert!(engine_llm
+            .evaluate_candidate(mutual_cand)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(stance.call_count(), 0);
+
+        // High-structural Q&A prompt qualifies for LLM, and BenignViral veto suppresses even if threshold low.
+        let cfg_low = RadarConfig::default()
+            .with_min_unique_authors(4)
+            .with_enable_llm_stance(true)
+            .with_thresholds(0.35, 0.30, 0.65);
+        let engine_veto = SkydopplerEngineBuilder::new(cfg_low)
+            .with_enricher(enricher)
+            .with_stance_classifier(stance.clone())
+            .build()
+            .unwrap();
+        let high_struct_qa = NetworkSurgeCandidate {
+            initial_metrics: StormMetrics {
+                unique_authors_short: 24,
+                unique_oon_authors_short: 24,
+                burst_z_score: 9.0,
+                ..Default::default()
+            },
+            ..mk_cand()
+        };
+        assert!(engine_veto
+            .evaluate_candidate(high_struct_qa)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(stance.call_count(), 1);
     }
 }

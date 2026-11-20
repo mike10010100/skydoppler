@@ -48,7 +48,7 @@ impl Default for StanceConfig {
             base_url: "http://localhost:11434".to_string(),
             api_key: None,
             model: "qwen3.5:9b".to_string(),
-            timeout: Duration::from_secs(15),
+            timeout: Duration::from_secs(30),
             max_retries: 1,
             num_ctx: 4096,
         }
@@ -383,7 +383,7 @@ impl LlmStormStanceClassifier {
 impl StormStanceClassifier for LlmStormStanceClassifier {
     async fn classify_storm(&self, input: &StormStanceInput) -> Result<StormStanceVerdict> {
         let bundle = Self::format_bundle_prompt(input);
-        let system_prompt = "Classify the network crowd reaction into one of: dogpile, public_figure_backlash, heated_debate, benign_viral, uncertain. Return strict JSON with collective_hostility (bool), confidence (0..1), classification, summary.";
+        let system_prompt = "Classify the Bluesky crowd reaction into one of: dogpile, public_figure_backlash, heated_debate, benign_viral, uncertain. Set collective_hostility=true for coordinated hostile pile-ons, dunks, or backlash; set classification='benign_viral' and collective_hostility=false for Q&A participation prompts, fandom threads, jokes, or enthusiastic viral engagement. Return strict JSON.";
 
         let mut last_err: Option<SkydopplerError> = None;
         for attempt in 0..=self.config.max_retries {
@@ -396,7 +396,31 @@ impl StormStanceClassifier for LlmStormStanceClassifier {
                 StanceDialect::Ollama => req.json(&serde_json::json!({
                     "model": self.config.model,
                     "stream": false,
-                    "format": "json",
+                    "think": false,
+                    "format": {
+                        "type": "object",
+                        "properties": {
+                            "collective_hostility": { "type": "boolean" },
+                            "confidence": { "type": "number" },
+                            "classification": {
+                                "type": "string",
+                                "enum": [
+                                    "dogpile",
+                                    "public_figure_backlash",
+                                    "heated_debate",
+                                    "benign_viral",
+                                    "uncertain"
+                                ]
+                            },
+                            "summary": { "type": "string" }
+                        },
+                        "required": [
+                            "collective_hostility",
+                            "confidence",
+                            "classification",
+                            "summary"
+                        ]
+                    },
                     "options": { "temperature": 0.0, "num_ctx": self.config.num_ctx },
                     "messages": [
                         { "role": "system", "content": system_prompt },
@@ -670,6 +694,10 @@ mod tests {
         let ov = ol.classify_storm(&sample_input()).await.unwrap();
         assert!(ov.collective_hostility);
         assert_eq!(ov.category, StormCategory::Dogpile);
+        let ollama_reqs = ollama.received_requests().await.unwrap();
+        let req_json: serde_json::Value = serde_json::from_slice(&ollama_reqs[0].body).unwrap();
+        assert_eq!(req_json["think"], serde_json::json!(false));
+        assert_eq!(req_json["format"]["type"], serde_json::json!("object"));
 
         // SystemOne live mock + missing answer error
         let sys = MockServer::start().await;

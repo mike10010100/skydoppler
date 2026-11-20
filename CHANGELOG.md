@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-11-20
+
+### Added
+
+- **Historical Quote-Dunk Discovery (`src/enricher.rs`, `src/engine.rs`)**:
+  - Added `app.bsky.feed.getQuotes` enrichment (`NetworkEnricher::fetch_post_quotes`) during Stage 2 evaluation so earlier viral quote-dunk catalysts are discovered even when Jetstream only observed recent replies.
+  - Added subthread `parent_uri` preference in `NetworkTracker::observe_post_create` and `2x`-author-growth cooldown bypass in `maybe_build_candidate`.
+
+### Changed
+
+- **Scoring Calibration & Catalyst Gating (`src/types.rs`, `src/math.rs`, `src/engine.rs`, `src/tracker.rs`)**:
+  - Calibrated `compute_structural_score` weights (`0.28`/`0.22`/`0.25`/`0.15`/`0.10`/`0.10`/`0.10`, velocity scale `18`) and `compute_vulnerability_weight` (`Large => 0.95`, `PublicFigure => 0.90`).
+  - Lowered default `enrich_cooldown` (`600s` -> `120s`), `stage1_trigger_score` (`0.40` -> `0.35`), `confirmed_score_threshold` (`0.62` -> `0.56`), and `structural_fallback_threshold` (`0.68` -> `0.65`), and raised `DEFAULT_MAX_TRACKED_POSTS` to `40_000`.
+  - Gated catalyst attribution (`MIN_CATALYST_ENGAGEMENT = 5`) so `0`-like quotes cannot inflate `power_asymmetry`, added a Stage 3 pre-filter for low-OON/low-ratio threads, and added a high-confidence `BenignViral` veto (`>= 0.70`).
+- **Hardened Ollama Stage 3 Integration (`src/stance.rs`, `src/daemon.rs`, `.env.example`)**:
+  - Sent `"think": false` and explicit JSON Schema `"format"` to Ollama `/api/chat`, increased default stance timeout to `30s`, refined the classification prompt for Q&A quote-prompts vs. dogpiles, and logged the configured stance model name on startup.
+
 ## [0.1.1] - 2026-11-20
 
 ### Fixed

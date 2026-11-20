@@ -68,8 +68,8 @@ pub const fn compute_vulnerability_weight(tier: TargetTier) -> f64 {
         TargetTier::Small => 1.15,
         TargetTier::Mid => 1.05,
         TargetTier::Unknown => 1.0,
-        TargetTier::Large => 0.90,
-        TargetTier::PublicFigure => 0.80,
+        TargetTier::Large => 0.95,
+        TargetTier::PublicFigure => 0.90,
     }
 }
 
@@ -92,7 +92,7 @@ pub fn compute_structural_score(
     } else {
         oon_ratio.clamp(0.0, 1.0)
     };
-    let velocity_term = ((oon_authors as f64) / 20.0).clamp(0.0, 1.0);
+    let velocity_term = ((oon_authors as f64) / 18.0).clamp(0.0, 1.0);
     let ratio_term = (direct_ratio.max(0.0) / 3.0).clamp(0.0, 1.0);
     let dunk_term = (dunk_ratio.max(0.0) / 8.0).clamp(0.0, 1.0);
     let asym_term = if power_asymmetry.is_finite() {
@@ -103,13 +103,13 @@ pub fn compute_structural_score(
     let burst_term = (burst_z_score.max(0.0) / 8.0).clamp(0.0, 1.0);
     let distress_term = ((defensive_signals as f64) / 3.0).clamp(0.0, 1.0);
 
-    let raw = 0.24 * velocity_term
-        + 0.18 * oon_ratio_clean
-        + 0.20 * ratio_term
-        + 0.14 * dunk_term
-        + 0.08 * asym_term
-        + 0.08 * burst_term
-        + 0.08 * distress_term;
+    let raw = 0.28 * velocity_term
+        + 0.22 * oon_ratio_clean
+        + 0.25 * ratio_term
+        + 0.15 * dunk_term
+        + 0.10 * asym_term
+        + 0.10 * burst_term
+        + 0.10 * distress_term;
 
     (raw * compute_vulnerability_weight(target_tier)).clamp(0.0, 1.0)
 }
@@ -285,8 +285,8 @@ mod tests {
         assert!((compute_vulnerability_weight(TargetTier::Small) - 1.15).abs() < 1e-9);
         assert!((compute_vulnerability_weight(TargetTier::Mid) - 1.05).abs() < 1e-9);
         assert!((compute_vulnerability_weight(TargetTier::Unknown) - 1.0).abs() < 1e-9);
-        assert!((compute_vulnerability_weight(TargetTier::Large) - 0.90).abs() < 1e-9);
-        assert!((compute_vulnerability_weight(TargetTier::PublicFigure) - 0.80).abs() < 1e-9);
+        assert!((compute_vulnerability_weight(TargetTier::Large) - 0.95).abs() < 1e-9);
+        assert!((compute_vulnerability_weight(TargetTier::PublicFigure) - 0.90).abs() < 1e-9);
 
         let high_small =
             compute_structural_score(30, 0.95, 5.0, 12.0, 150.0, 10.0, 4, TargetTier::Small);
@@ -294,27 +294,27 @@ mod tests {
 
         // Isolated non-saturated term checks for compute_structural_score
         assert!(
-            (compute_structural_score(10, 0.0, 0.0, 0.0, 1.0, 0.0, 0, TargetTier::Unknown) - 0.12)
+            (compute_structural_score(9, 0.0, 0.0, 0.0, 1.0, 0.0, 0, TargetTier::Unknown) - 0.14)
                 .abs()
                 < 1e-9
         );
         assert!(
-            (compute_structural_score(0, 0.5, 0.0, 0.0, 1.0, 0.0, 0, TargetTier::Unknown) - 0.09)
+            (compute_structural_score(0, 0.5, 0.0, 0.0, 1.0, 0.0, 0, TargetTier::Unknown) - 0.11)
                 .abs()
                 < 1e-9
         );
         assert!(
-            (compute_structural_score(0, 0.0, 1.5, 0.0, 1.0, 0.0, 0, TargetTier::Unknown) - 0.10)
+            (compute_structural_score(0, 0.0, 1.5, 0.0, 1.0, 0.0, 0, TargetTier::Unknown) - 0.125)
                 .abs()
                 < 1e-9
         );
         assert!(
-            (compute_structural_score(0, 0.0, 0.0, 2.0, 1.0, 0.0, 0, TargetTier::Unknown) - 0.035)
+            (compute_structural_score(0, 0.0, 0.0, 2.0, 1.0, 0.0, 0, TargetTier::Unknown) - 0.0375)
                 .abs()
                 < 1e-9
         );
         assert!(
-            (compute_structural_score(0, 0.0, 0.0, 0.0, 10.0, 0.0, 0, TargetTier::Unknown) - 0.032)
+            (compute_structural_score(0, 0.0, 0.0, 0.0, 10.0, 0.0, 0, TargetTier::Unknown) - 0.04)
                 .abs()
                 < 1e-9
         );
@@ -338,24 +338,24 @@ mod tests {
                 < 1e-9
         );
         assert!(
-            (compute_structural_score(0, 0.0, 0.0, 0.0, 1.0, 2.0, 0, TargetTier::Unknown) - 0.02)
+            (compute_structural_score(0, 0.0, 0.0, 0.0, 1.0, 2.0, 0, TargetTier::Unknown) - 0.025)
                 .abs()
                 < 1e-9
         );
         assert!(
             (compute_structural_score(0, 0.0, 0.0, 0.0, 1.0, 0.0, 1, TargetTier::Unknown)
-                - (0.08 / 3.0))
+                - (0.10 / 3.0))
                 .abs()
                 < 1e-9
         );
 
-        let expected_combined = 0.12 + 0.09 + 0.10 + 0.035 + 0.032 + 0.02 + (0.08 / 3.0);
+        let expected_combined = 0.14 + 0.11 + 0.125 + 0.0375 + 0.04 + 0.025 + (0.10 / 3.0);
         let actual_combined =
-            compute_structural_score(10, 0.5, 1.5, 2.0, 10.0, 2.0, 1, TargetTier::Unknown);
+            compute_structural_score(9, 0.5, 1.5, 2.0, 10.0, 2.0, 1, TargetTier::Unknown);
         assert!((actual_combined - expected_combined).abs() < 1e-9);
 
         let actual_small =
-            compute_structural_score(10, 0.5, 1.5, 2.0, 10.0, 2.0, 1, TargetTier::Small);
+            compute_structural_score(9, 0.5, 1.5, 2.0, 10.0, 2.0, 1, TargetTier::Small);
         assert!((actual_small - expected_combined * 1.15).abs() < 1e-9);
 
         let nan_inputs =
