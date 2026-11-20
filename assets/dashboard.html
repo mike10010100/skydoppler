@@ -581,6 +581,10 @@
           .replace(/'/g, '&#39;');
       }
 
+      function encodeBskyActor(actor) {
+        return encodeURIComponent(actor).replace(/%3A/gi, ':');
+      }
+
       function atUriToBskyWebUrl(uri) {
         if (typeof uri !== 'string' || !uri.startsWith('at://')) return null;
         const parts = uri.slice(5).split('/');
@@ -589,14 +593,14 @@
         const safeActor = /^[A-Za-z0-9.:_-]+$/.test(actor);
         const safeRkey = /^[A-Za-z0-9._~-]+$/.test(rkey);
         if (!safeActor || !safeRkey || collection !== 'app.bsky.feed.post') return null;
-        return `https://bsky.app/profile/${encodeURIComponent(actor)}/post/${encodeURIComponent(rkey)}`;
+        return `https://bsky.app/profile/${encodeBskyActor(actor)}/post/${encodeURIComponent(rkey)}`;
       }
 
       function safeHandleUrl(handleOrDid) {
         if (typeof handleOrDid !== 'string') return null;
         const cleaned = handleOrDid.trim();
         if (!/^[A-Za-z0-9.:_-]+$/.test(cleaned)) return null;
-        return `https://bsky.app/profile/${encodeURIComponent(cleaned)}`;
+        return `https://bsky.app/profile/${encodeBskyActor(cleaned)}`;
       }
 
       function severityColor(sev) {
