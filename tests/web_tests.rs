@@ -225,6 +225,7 @@ async fn dashboard_health_metrics_weather_redaction_operator_auth_and_dismiss() 
         )
         .unwrap();
         assert!(txt.contains("skydoppler_commits_received_total"));
+        assert!(txt.contains("skydoppler_stage3_stance_fallbacks_total"));
         assert!(txt.contains("skydoppler_storms_detected_total 2"));
         assert!(txt.contains("skydoppler_active_storms 2"));
         assert!(txt.contains("skydoppler_weather_index"));

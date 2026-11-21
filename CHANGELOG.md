@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-11-21
+
+### Fixed
+
+- **Stage 3 Stance Observability & Fallback Telemetry (`src/engine.rs`, `src/web/api.rs`)**:
+  - Promoted Stage 3 LLM stance failures from silent `debug!` logs to `warn!` and incremented both `errors_encountered` and a new backward-compatible (`#[serde(default)]`) `stage3_stance_fallbacks` counter exported as `skydoppler_stage3_stance_fallbacks_total` on `/metrics`.
+  - Logged privacy-safe Stage 3 stance verdicts (`cell_id`, `tier`, `evaluator`, `category`, `hostile`, `confidence`, and aggregate ratios — never target handles/DIDs/text) at `INFO`.
+
 ## [0.2.1] - 2026-11-20
 
 ### Added
