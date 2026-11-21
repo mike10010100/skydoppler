@@ -271,6 +271,20 @@ pub async fn get_prometheus_metrics(State(state): State<ApiState>) -> Response {
 
     let _ = writeln!(
         out,
+        "\n# HELP skydoppler_stage3_stance_fallbacks_total Stage 3 LLM stance calls that failed and fell back to structural scoring."
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE skydoppler_stage3_stance_fallbacks_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "skydoppler_stage3_stance_fallbacks_total {}",
+        stats.stage3_stance_fallbacks
+    );
+
+    let _ = writeln!(
+        out,
         "\n# HELP skydoppler_storms_detected_total Confirmed network storms persisted."
     );
     let _ = writeln!(out, "# TYPE skydoppler_storms_detected_total counter");

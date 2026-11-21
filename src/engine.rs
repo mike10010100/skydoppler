@@ -61,6 +61,8 @@ pub struct EngineStats {
     pub stage2_enrichments: AtomicU64,
     /// Stage 3 LLM stance invocations completed.
     pub stage3_stance_calls: AtomicU64,
+    /// Stage 3 LLM stance invocations that failed and fell back to structural scoring.
+    pub stage3_stance_fallbacks: AtomicU64,
     /// Confirmed storm cells persisted to storage.
     pub storms_detected: AtomicU64,
     /// Escalations emitted on previously active storms.
@@ -92,6 +94,9 @@ pub struct EngineStatsSnapshot {
     pub stage2_enrichments: u64,
     /// Stage 3 LLM stance calls executed.
     pub stage3_stance_calls: u64,
+    /// Stage 3 LLM stance failures that degraded to structural fallback.
+    #[serde(default)]
+    pub stage3_stance_fallbacks: u64,
     /// Confirmed storms detected.
     pub storms_detected: u64,
     /// Storm escalations observed.
@@ -116,6 +121,7 @@ impl EngineStats {
             stage1_queue_shed: self.stage1_queue_shed.load(Ordering::Relaxed),
             stage2_enrichments: self.stage2_enrichments.load(Ordering::Relaxed),
             stage3_stance_calls: self.stage3_stance_calls.load(Ordering::Relaxed),
+            stage3_stance_fallbacks: self.stage3_stance_fallbacks.load(Ordering::Relaxed),
             storms_detected: self.storms_detected.load(Ordering::Relaxed),
             storms_escalated: self.storms_escalated.load(Ordering::Relaxed),
             storms_suppressed_benign: self.storms_suppressed_benign.load(Ordering::Relaxed),
@@ -142,6 +148,8 @@ impl EngineStats {
             .store(snap.stage2_enrichments, Ordering::Relaxed);
         self.stage3_stance_calls
             .store(snap.stage3_stance_calls, Ordering::Relaxed);
+        self.stage3_stance_fallbacks
+            .store(snap.stage3_stance_fallbacks, Ordering::Relaxed);
         self.storms_detected
             .store(snap.storms_detected, Ordering::Relaxed);
         self.storms_escalated
@@ -620,6 +628,8 @@ impl SkydopplerEngine {
             && (has_sufficient_oon || has_distress)
             && has_hostile_signal;
 
+        let cell_id = opaque_cell_id(&candidate.focal_post_uri);
+
         // 4. Optional Stage 3 bundled LLM stance check
         let stance = if self.config.enable_llm_stance && qualifies_for_stance {
             self.stats
@@ -638,9 +648,36 @@ impl SkydopplerEngine {
                 metrics: metrics.clone(),
             };
             match self.stance.classify_storm(&input).await {
-                Ok(v) => Some(v),
+                Ok(v) => {
+                    info!(
+                        cell = %cell_id,
+                        tier = %target_tier,
+                        evaluator = %v.evaluator,
+                        category = %v.category,
+                        hostile = v.collective_hostility,
+                        confidence = %format!("{:.2}", v.confidence),
+                        oon_authors = metrics.unique_oon_authors_short,
+                        direct_ratio = %format!("{:.2}", metrics.direct_ratio),
+                        dunk_ratio = %format!("{:.2}", metrics.dunk_ratio),
+                        structural = %format!("{:.3}", metrics.structural_score),
+                        "Stage 3 stance verdict received"
+                    );
+                    Some(v)
+                }
                 Err(e) => {
-                    debug!(error = %e, "Stage 3 stance failed; using structural fallback");
+                    self.stats
+                        .stage3_stance_fallbacks
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.stats
+                        .errors_encountered
+                        .fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        cell = %cell_id,
+                        tier = %target_tier,
+                        structural = %format!("{:.3}", metrics.structural_score),
+                        error = %e,
+                        "Stage 3 stance failed; using structural fallback"
+                    );
                     Some(StormStanceVerdict::new(
                         false,
                         0.0,
@@ -673,8 +710,6 @@ impl SkydopplerEngine {
         } else {
             metrics.structural_score >= self.config.structural_fallback_threshold
         };
-
-        let cell_id = opaque_cell_id(&candidate.focal_post_uri);
 
         if !confirmed {
             self.stats
@@ -1442,5 +1477,79 @@ mod tests {
             .expect("genuine editorial backlash should confirm");
         assert_eq!(confirmed.category, StormCategory::PublicFigureBacklash);
         assert_eq!(stance.call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn engine_tracks_stage3_fallbacks_errors_and_legacy_stats_snapshot() {
+        let enricher = Arc::new(MockNetworkEnricher::new());
+        let focal_uri = "at://did:plc:smallfb/app.bsky.feed.post/3kfb";
+        enricher.set_post(PostEngagementSnapshot {
+            uri: focal_uri.to_string(),
+            author_did: "did:plc:smallfb".to_string(),
+            author_handle: Some("smallfb.bsky.social".to_string()),
+            author_followers: Some(250),
+            text: "Targeted post".to_string(),
+            reply_count: 60,
+            repost_count: 0,
+            like_count: 1,
+            quote_count: 10,
+            ..Default::default()
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:smallfb".to_string(),
+            handle: Some("smallfb.bsky.social".to_string()),
+            followers_count: Some(250),
+            ..Default::default()
+        });
+
+        let failing_stance = Arc::new(MockStormStanceClassifier::failing("connection refused"));
+        let cfg = RadarConfig::default()
+            .with_min_unique_authors(4)
+            .with_enable_llm_stance(true)
+            .with_thresholds(0.35, 0.56, 0.65);
+        let engine = SkydopplerEngineBuilder::new(cfg)
+            .with_enricher(enricher)
+            .with_stance_classifier(failing_stance)
+            .build()
+            .unwrap();
+
+        let cand = NetworkSurgeCandidate {
+            target_did: "did:plc:smallfb".to_string(),
+            focal_post_uri: focal_uri.to_string(),
+            observed_at_us: current_time_us(),
+            initial_metrics: StormMetrics {
+                unique_authors_short: 24,
+                unique_oon_authors_short: 24,
+                burst_z_score: 9.0,
+                ..Default::default()
+            },
+            sample_replies: vec![SampleReply {
+                author_did: "did:plc:oon1".to_string(),
+                kind: InteractionKind::Reply,
+                post_uri: "at://did:plc:oon1/app.bsky.feed.post/1".to_string(),
+                text_snippet: "Pile on".to_string(),
+            }],
+            recent_quote_uris: vec![],
+        };
+
+        let storm = engine
+            .evaluate_candidate(cand)
+            .await
+            .unwrap()
+            .expect("high structural score should still confirm via fallback");
+        assert_eq!(
+            storm.stance.as_ref().unwrap().evaluator,
+            "structural_fallback"
+        );
+        let snap = engine.stats().snapshot();
+        assert_eq!(snap.stage3_stance_calls, 1);
+        assert_eq!(snap.stage3_stance_fallbacks, 1);
+        assert_eq!(snap.errors_encountered, 1);
+
+        // Legacy persisted EngineStatsSnapshot JSON without stage3_stance_fallbacks must deserialize cleanly.
+        let legacy_json = r#"{"commits_received":100,"posts_observed":20,"hot_likes_observed":30,"cold_likes_ignored":50,"defensive_signals":2,"stage1_candidates":4,"stage1_queue_shed":0,"stage2_enrichments":4,"stage3_stance_calls":1,"storms_detected":1,"storms_escalated":0,"storms_suppressed_benign":3,"errors_encountered":0}"#;
+        let restored: EngineStatsSnapshot = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(restored.stage3_stance_fallbacks, 0);
+        assert_eq!(restored.stage3_stance_calls, 1);
     }
 }
