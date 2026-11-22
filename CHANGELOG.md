@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-11-22
+
+### Changed
+
+- **Lowered Public Follower Redaction Threshold (`src/types.rs`, `src/engine.rs`, `assets/dashboard.html`, `.env.example`)**:
+  - Lowered `DEFAULT_PUBLIC_FOLLOWER_THRESHOLD` (`5_000` -> `20`) so only accounts under `20` followers (or with unknown follower counts) are hidden on public unauthenticated REST and SSE endpoints.
+  - Updated `SkydopplerEngine::current_weather` so `WeatherSummary::small_target_storms` tracks storms redacted under `config.public_follower_threshold` via `should_redact_publicly`.
+  - Updated dashboard UI redaction copy (`< 20 followers`) and responder window label (`10m`).
+
 ## [0.3.0] - 2026-11-22
 
 ### Changed

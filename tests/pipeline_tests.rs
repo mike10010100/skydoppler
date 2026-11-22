@@ -36,7 +36,7 @@ impl Respond for AppViewRouterMock {
                         {
                             json!({
                                 "uri": uri,
-                                "author": { "did": "did:plc:smallvictim", "handle": "smallvictim.bsky.social", "followersCount": 420 },
+                                "author": { "did": "did:plc:smallvictim", "handle": "smallvictim.bsky.social", "followersCount": 12 },
                                 "record": { "text": "I just like sourdough bread." },
                                 "replyCount": 45, "repostCount": 1, "likeCount": 3, "quoteCount": 9
                             })
@@ -78,7 +78,7 @@ impl Respond for AppViewRouterMock {
 
         if p == "/xrpc/app.bsky.actor.getProfiles" {
             let profiles = vec![
-                json!({ "did": "did:plc:smallvictim", "handle": "smallvictim.bsky.social", "followersCount": 420 }),
+                json!({ "did": "did:plc:smallvictim", "handle": "smallvictim.bsky.social", "followersCount": 12 }),
                 json!({ "did": "did:plc:catalystqt", "handle": "bigdunker.bsky.social", "followersCount": 120000 }),
                 json!({ "did": "did:plc:pubfig", "handle": "celeb.bsky.social", "followersCount": 250000 }),
                 json!({ "did": "did:plc:benign", "handle": "artist.bsky.social", "followersCount": 18000 }),
@@ -218,7 +218,7 @@ async fn end_to_end_5000_commit_streaming_funnel_and_redaction_and_persistence()
 
     let mut now = current_time_us();
 
-    // 1) Flash quote-dunk dogpile against small account (< 5,000 followers)
+    // 1) Flash quote-dunk dogpile against small account (< 20 followers)
     let small_root = "at://did:plc:smallvictim/app.bsky.feed.post/3kroot";
     now += 1_000;
     mock_ws
@@ -304,7 +304,7 @@ async fn end_to_end_5000_commit_streaming_funnel_and_redaction_and_persistence()
             .unwrap();
     }
 
-    // 3) Public figure backlash (>= 5,000 followers)
+    // 3) Public figure backlash (>= 20 followers)
     let pub_root = "at://did:plc:pubfig/app.bsky.feed.post/3kpub";
     for idx in 0..8 {
         now += 1_000;

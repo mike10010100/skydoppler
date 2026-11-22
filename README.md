@@ -15,7 +15,7 @@
   2. 16-shard bounded heavy-hitter tracker ([`src/tracker.rs`](src/tracker.rs)) with rolling `5m`/`30m` windows and defensive distress deltas.
   3. Token-bucketed batched AppView enrichment ([`src/enricher.rs`](src/enricher.rs)): `getPosts`, `getProfiles`, and `getRelationships` (on-demand out-of-network ratio without storing a global social graph).
   4. Optional bundled LLM stance classification ([`src/stance.rs`](src/stance.rs)) with deterministic structural-score fallback.
-- **Fail-Closed Small-Account Redaction** ([`src/redact.rs`](src/redact.rs)): Targets under `5,000` followers (or with unknown follower counts) have identifying handles, DIDs, post URIs, snippets, and catalyst links stripped on all public REST and SSE endpoints.
+- **Fail-Closed Small-Account Redaction** ([`src/redact.rs`](src/redact.rs)): Targets under `20` followers (or with unknown follower counts) have identifying handles, DIDs, post URIs, snippets, and catalyst links stripped on all public REST and SSE endpoints.
 - **Live Animated Doppler Radar UI** ([`assets/dashboard.html`](assets/dashboard.html)): HTML5 Canvas polar Doppler sweep, Atmospheric Weather Index (`Clear` through `Supercell`), live SSE feed, Prometheus `/metrics`, and constant-time operator authentication.
 - **Pure Safe Rust**: `#![forbid(unsafe_code)]`, zero `.unwrap()`/`.expect()`/`panic!()` in production code, zero C/OpenSSL dependencies (Rustls only).
 

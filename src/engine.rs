@@ -914,7 +914,7 @@ impl SkydopplerEngine {
                 crate::types::StormSeverity::High => high_storms += 1,
                 crate::types::StormSeverity::Elevated => elevated_storms += 1,
             }
-            if matches!(s.target_tier, TargetTier::Small | TargetTier::Unknown) {
+            if crate::redact::should_redact_publicly(s, self.config.public_follower_threshold) {
                 small_target_storms += 1;
             }
             if s.category == StormCategory::PublicFigureBacklash {
@@ -1127,7 +1127,7 @@ mod tests {
             uri: focal_uri.to_string(),
             author_did: "did:plc:small".to_string(),
             author_handle: Some("small.bsky.social".to_string()),
-            author_followers: Some(150),
+            author_followers: Some(15),
             text: "Small account post".to_string(),
             reply_count: 55,
             repost_count: 1,
@@ -1150,7 +1150,7 @@ mod tests {
         enricher.set_profile(ActorSummary {
             did: "did:plc:small".to_string(),
             handle: Some("small.bsky.social".to_string()),
-            followers_count: Some(150),
+            followers_count: Some(15),
             ..Default::default()
         });
         enricher.set_profile(ActorSummary {

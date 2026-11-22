@@ -429,7 +429,7 @@
       <div class="kpi-card">
         <div class="kpi-label">Protected Small Accounts</div>
         <div class="kpi-value" id="kpi-small-targets">0</div>
-        <div class="kpi-sub">Fail-closed redacted under 5k followers</div>
+        <div class="kpi-sub">Fail-closed redacted under 20 followers</div>
       </div>
 
       <div class="kpi-card">
@@ -458,7 +458,7 @@
               <span class="legend-item"><span class="legend-swatch" style="background:var(--critical);"></span>Critical</span>
               <span class="legend-item"><span class="legend-swatch" style="background:var(--high);"></span>High</span>
               <span class="legend-item"><span class="legend-swatch" style="background:var(--elevated);"></span>Elevated</span>
-              <span class="legend-item"><span class="legend-swatch" style="border:2px solid var(--shield);background:transparent;"></span>Redacted &lt;5k</span>
+              <span class="legend-item"><span class="legend-swatch" style="border:2px solid var(--shield);background:transparent;"></span>Redacted &lt;20</span>
             </div>
           </div>
         </div>
@@ -736,7 +736,7 @@
           const dunk = Number(m.dunk_ratio || 0).toFixed(1);
           const oon = Math.round(Number(m.out_of_network_ratio || 0) * 100);
           const bodyHtml = redacted
-            ? '<div class="redacted-notice">🛡️ Protected Small Account (&lt; 5,000 followers) — identity &amp; post redacted publicly to prevent secondary amplification.</div>'
+            ? '<div class="redacted-notice">🛡️ Protected Small Account (&lt; 20 followers) — identity &amp; post redacted publicly to prevent secondary amplification.</div>'
             : (() => {
                 const targetLabel = escapeHtml(s.target_handle || s.target_did || 'Unknown');
                 const handleHref = safeHandleUrl(s.target_handle || s.target_did);
@@ -834,7 +834,7 @@
           ${identityBlock}
           <div class="inspector-grid">
             <div class="metric-box"><span>Composite Score</span><strong>${Number(m.composite_score || 0).toFixed(2)}</strong></div>
-            <div class="metric-box"><span>Unique Responders (5m)</span><strong>${Number(m.unique_authors_short || 0)}</strong></div>
+            <div class="metric-box"><span>Unique Responders (10m)</span><strong>${Number(m.unique_authors_short || 0)}</strong></div>
             <div class="metric-box"><span>Dunk Ratio</span><strong>${Number(m.dunk_ratio || 0).toFixed(2)}x</strong></div>
             <div class="metric-box"><span>Direct Reply/Like</span><strong>${Number(m.direct_ratio || 0).toFixed(2)}</strong></div>
             <div class="metric-box"><span>Out-of-Network</span><strong>${Math.round(Number(m.out_of_network_ratio || 0) * 100)}%</strong></div>

@@ -36,8 +36,8 @@ Tracking every post across the entire Bluesky network without a global follow gr
 
 Surfacing an unredacted real-time list of small accounts currently being dogpiled creates secondary harassment and rubbernecking risks. **SkyDoppler enforces fail-closed privacy by construction**:
 
-- Any target with fewer than `public_follower_threshold` followers (`5,000` by default) **or unknown follower count (`None`)** is serialized publicly as an anonymized radar cell (`cell-<hex>`), stripping `target_did`, `target_handle`, `focal_post_uri`, `focal_post_snippet`, and `top_catalyst`.
-- Full attribution is visible only for `>= 5,000` follower accounts/public figures publicly, or to authenticated operators (`Authorization: Bearer` / `HttpOnly; SameSite=Strict` cookie using `subtle::ConstantTimeEq`).
+- Any target with fewer than `public_follower_threshold` followers (`20` by default) **or unknown follower count (`None`)** is serialized publicly as an anonymized radar cell (`cell-<hex>`), stripping `target_did`, `target_handle`, `focal_post_uri`, `focal_post_snippet`, and `top_catalyst`.
+- Full attribution is visible only for `>= 20` follower accounts/public figures publicly, or to authenticated operators (`Authorization: Bearer` / `HttpOnly; SameSite=Strict` cookie using `subtle::ConstantTimeEq`).
 
 ---
 

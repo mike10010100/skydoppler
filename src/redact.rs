@@ -40,9 +40,9 @@ pub fn opaque_cell_id(focal_post_uri: &str) -> String {
 /// ```
 /// use skydoppler::redact::should_redact_followers;
 ///
-/// assert!(should_redact_followers(None, 5_000));
-/// assert!(should_redact_followers(Some(4_999), 5_000));
-/// assert!(!should_redact_followers(Some(5_000), 5_000));
+/// assert!(should_redact_followers(None, 20));
+/// assert!(should_redact_followers(Some(19), 20));
+/// assert!(!should_redact_followers(Some(20), 20));
 /// ```
 #[must_use]
 pub const fn should_redact_followers(
@@ -329,10 +329,10 @@ mod tests {
 
     #[test]
     fn fail_closed_redacts_small_and_unknown_accounts_and_exposes_large() {
-        for followers in [None, Some(0), Some(4_999)] {
+        for followers in [None, Some(0), Some(19)] {
             let storm = sample_storm(followers);
-            assert!(should_redact_publicly(&storm, 5_000));
-            let pub_view = PublicStormView::from_storm(&storm, 5_000);
+            assert!(should_redact_publicly(&storm, 20));
+            let pub_view = PublicStormView::from_storm(&storm, 20);
             assert!(pub_view.redacted);
             assert_eq!(
                 pub_view.redaction_reason.as_deref(),
@@ -352,10 +352,10 @@ mod tests {
             assert!(!json.contains("Catalyst dunk text"));
         }
 
-        // Exact boundary >= 5000 is unredacted publicly
-        let large = sample_storm(Some(5_000));
-        assert!(!should_redact_publicly(&large, 5_000));
-        let pub_large = PublicStormView::from_storm(&large, 5_000);
+        // Exact boundary >= 20 is unredacted publicly
+        let large = sample_storm(Some(20));
+        assert!(!should_redact_publicly(&large, 20));
+        let pub_large = PublicStormView::from_storm(&large, 20);
         assert!(!pub_large.redacted);
         assert!(pub_large.redaction_reason.is_none());
         assert_eq!(
@@ -367,13 +367,13 @@ mod tests {
         // Blank focal snippet normalizes to None in PublicStormView
         let mut blank_snip = large.clone();
         blank_snip.focal_post_snippet = "   ".to_string();
-        assert!(PublicStormView::from_storm(&blank_snip, 5_000)
+        assert!(PublicStormView::from_storm(&blank_snip, 20)
             .focal_post_snippet
             .is_none());
 
         // Operator view preserves full details regardless of follower count
-        let small = sample_storm(Some(120));
-        let op_view = OperatorStormView::from_storm(small.clone(), 5_000);
+        let small = sample_storm(Some(15));
+        let op_view = OperatorStormView::from_storm(small.clone(), 20);
         assert!(op_view.redacted_for_public);
         assert_eq!(op_view.storm.target_did, "did:plc:secret_target");
 
@@ -382,12 +382,12 @@ mod tests {
             storm: Box::new(small),
             is_escalation: true,
         };
-        let pub_ev = WireRadarEvent::project(&ev, false, 5_000);
+        let pub_ev = WireRadarEvent::project(&ev, false, 20);
         let pub_ev_json = serde_json::to_string(&pub_ev).unwrap();
         assert!(!pub_ev_json.contains("did:plc:secret_target"));
         assert!(!pub_ev_json.contains("Sensitive personal post text"));
 
-        let op_ev = WireRadarEvent::project(&ev, true, 5_000);
+        let op_ev = WireRadarEvent::project(&ev, true, 20);
         assert!(matches!(op_ev, WireRadarEvent::OperatorStormUpsert { .. }));
 
         let closed = RadarEvent::StormClosed {
@@ -396,7 +396,7 @@ mod tests {
             status: StormStatus::Resolved,
         };
         assert!(matches!(
-            WireRadarEvent::project(&closed, false, 5_000),
+            WireRadarEvent::project(&closed, false, 20),
             WireRadarEvent::StormClosed { .. }
         ));
 
