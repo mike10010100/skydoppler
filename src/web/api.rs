@@ -285,6 +285,20 @@ pub async fn get_prometheus_metrics(State(state): State<ApiState>) -> Response {
 
     let _ = writeln!(
         out,
+        "\n# HELP skydoppler_stage3_benign_cache_hits_total Stage 2/3 evaluations short-circuited by the benign verdict cache."
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE skydoppler_stage3_benign_cache_hits_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "skydoppler_stage3_benign_cache_hits_total {}",
+        stats.stage3_benign_cache_hits
+    );
+
+    let _ = writeln!(
+        out,
         "\n# HELP skydoppler_storms_detected_total Confirmed network storms persisted."
     );
     let _ = writeln!(out, "# TYPE skydoppler_storms_detected_total counter");

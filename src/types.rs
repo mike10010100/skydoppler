@@ -8,14 +8,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::SkydopplerError;
 
-/// Default sliding short burst window duration in seconds (5 minutes).
-pub const DEFAULT_SHORT_WINDOW_SECS: u64 = 300;
+/// Default sliding short burst window duration in seconds (10 minutes).
+pub const DEFAULT_SHORT_WINDOW_SECS: u64 = 600;
 /// Default sliding medium baseline window duration in seconds (30 minutes).
 pub const DEFAULT_MEDIUM_WINDOW_SECS: u64 = 1800;
 /// Default minimum unique responder DIDs before Stage 2 AppView enrichment triggers.
-pub const DEFAULT_MIN_UNIQUE_AUTHORS: usize = 8;
+pub const DEFAULT_MIN_UNIQUE_AUTHORS: usize = 6;
 /// Default minimum streaming replies+quotes / (likes+reposts+replies+quotes) ratio trigger.
-pub const DEFAULT_MIN_STREAMING_RATIO: f64 = 0.50;
+pub const DEFAULT_MIN_STREAMING_RATIO: f64 = 0.30;
 /// Default hard cap on concurrently tracked hot posts across all shards.
 pub const DEFAULT_MAX_TRACKED_POSTS: usize = 40_000;
 /// Default hard cap on concurrently tracked target authors for defensive distress bursts.

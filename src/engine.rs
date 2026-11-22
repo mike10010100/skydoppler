@@ -1,6 +1,7 @@
 //! Real-time streaming radar engine coordinating Stage 1 ingestion, Stage 2 AppView enrichment,
 //! Stage 3 LLM stance verification, weather computation, SQLite projection, and live SSE fanout.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -36,9 +37,12 @@ const MIN_CATALYST_ENGAGEMENT: u64 = 5;
 const MIN_CATALYST_DUNK_RATIO: f64 = 0.50;
 const MIN_STANCE_STRUCTURAL_SCORE: f64 = 0.30;
 const MIN_STANCE_OON_RATIO: f64 = 0.25;
-const MIN_STANCE_DIRECT_RATIO: f64 = 0.60;
+const MIN_STANCE_DIRECT_RATIO: f64 = 0.45;
 const MIN_STANCE_DUNK_RATIO: f64 = 1.0;
 const BENIGN_VIRAL_VETO_CONFIDENCE: f64 = 0.60;
+const BENIGN_CACHE_TTL_US: u64 = 1_800_000_000;
+const BENIGN_CACHE_MIN_CONFIDENCE: f64 = 0.90;
+const BENIGN_CACHE_MAX_ENTRIES: usize = 4_096;
 
 /// Thread-safe atomic counters tracking firehose throughput and radar detections.
 #[derive(Debug, Default)]
@@ -63,6 +67,8 @@ pub struct EngineStats {
     pub stage3_stance_calls: AtomicU64,
     /// Stage 3 LLM stance invocations that failed and fell back to structural scoring.
     pub stage3_stance_fallbacks: AtomicU64,
+    /// Stage 2/3 evaluations short-circuited by the high-confidence benign verdict cache.
+    pub stage3_benign_cache_hits: AtomicU64,
     /// Confirmed storm cells persisted to storage.
     pub storms_detected: AtomicU64,
     /// Escalations emitted on previously active storms.
@@ -97,6 +103,9 @@ pub struct EngineStatsSnapshot {
     /// Stage 3 LLM stance failures that degraded to structural fallback.
     #[serde(default)]
     pub stage3_stance_fallbacks: u64,
+    /// Stage 2/3 evaluations short-circuited by the benign verdict cache.
+    #[serde(default)]
+    pub stage3_benign_cache_hits: u64,
     /// Confirmed storms detected.
     pub storms_detected: u64,
     /// Storm escalations observed.
@@ -122,6 +131,7 @@ impl EngineStats {
             stage2_enrichments: self.stage2_enrichments.load(Ordering::Relaxed),
             stage3_stance_calls: self.stage3_stance_calls.load(Ordering::Relaxed),
             stage3_stance_fallbacks: self.stage3_stance_fallbacks.load(Ordering::Relaxed),
+            stage3_benign_cache_hits: self.stage3_benign_cache_hits.load(Ordering::Relaxed),
             storms_detected: self.storms_detected.load(Ordering::Relaxed),
             storms_escalated: self.storms_escalated.load(Ordering::Relaxed),
             storms_suppressed_benign: self.storms_suppressed_benign.load(Ordering::Relaxed),
@@ -150,6 +160,8 @@ impl EngineStats {
             .store(snap.stage3_stance_calls, Ordering::Relaxed);
         self.stage3_stance_fallbacks
             .store(snap.stage3_stance_fallbacks, Ordering::Relaxed);
+        self.stage3_benign_cache_hits
+            .store(snap.stage3_benign_cache_hits, Ordering::Relaxed);
         self.storms_detected
             .store(snap.storms_detected, Ordering::Relaxed);
         self.storms_escalated
@@ -159,6 +171,38 @@ impl EngineStats {
         self.errors_encountered
             .store(snap.errors_encountered, Ordering::Relaxed);
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BenignCacheEntry {
+    suppressed_at_us: u64,
+    unique_authors_short: usize,
+}
+
+fn insert_benign_entry(
+    cache: &mut HashMap<String, BenignCacheEntry>,
+    uri: String,
+    entry: BenignCacheEntry,
+    max_entries: usize,
+) {
+    if !cache.contains_key(&uri) && cache.len() >= max_entries {
+        cache.retain(|_, existing| {
+            entry
+                .suppressed_at_us
+                .saturating_sub(existing.suppressed_at_us)
+                < BENIGN_CACHE_TTL_US
+        });
+        if cache.len() >= max_entries {
+            if let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, existing)| existing.suppressed_at_us)
+                .map(|(k, _)| k.clone())
+            {
+                cache.remove(&oldest_key);
+            }
+        }
+    }
+    cache.insert(uri, entry);
 }
 
 #[derive(Debug)]
@@ -190,6 +234,7 @@ pub struct SkydopplerEngine {
     events_tx: broadcast::Sender<RadarEvent>,
     throughput: Arc<Mutex<ThroughputMeter>>,
     latest_cursor_us: Arc<AtomicU64>,
+    benign_cache: Arc<Mutex<HashMap<String, BenignCacheEntry>>>,
 }
 
 /// Ergonomic builder for constructing a [`SkydopplerEngine`].
@@ -288,6 +333,7 @@ impl SkydopplerEngineBuilder {
                 ..Default::default()
             })),
             latest_cursor_us: Arc::new(AtomicU64::new(cursor)),
+            benign_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 }
@@ -467,6 +513,36 @@ impl SkydopplerEngine {
         &self,
         candidate: NetworkSurgeCandidate,
     ) -> Result<Option<NetworkStorm>> {
+        let cell_id = opaque_cell_id(&candidate.focal_post_uri);
+        let initial_distress_total = candidate
+            .initial_metrics
+            .defensive_blocks
+            .saturating_add(candidate.initial_metrics.defensive_detaches)
+            .saturating_add(candidate.initial_metrics.defensive_threadgates);
+        let initial_has_distress =
+            initial_distress_total >= self.config.defensive_distress_threshold;
+        if self.config.enable_llm_stance
+            && self.is_benign_cached(
+                &candidate.focal_post_uri,
+                candidate.observed_at_us,
+                candidate.initial_metrics.unique_authors_short,
+                initial_has_distress,
+            )
+        {
+            self.stats
+                .stage3_benign_cache_hits
+                .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .storms_suppressed_benign
+                .fetch_add(1, Ordering::Relaxed);
+            debug!(
+                cell = %cell_id,
+                authors = candidate.initial_metrics.unique_authors_short,
+                "Stage 2/3 candidate suppressed by benign verdict cache"
+            );
+            return Ok(None);
+        }
+
         self.stats
             .stage2_enrichments
             .fetch_add(1, Ordering::Relaxed);
@@ -628,8 +704,6 @@ impl SkydopplerEngine {
             && (has_sufficient_oon || has_distress)
             && has_hostile_signal;
 
-        let cell_id = opaque_cell_id(&candidate.focal_post_uri);
-
         // 4. Optional Stage 3 bundled LLM stance check
         let stance = if self.config.enable_llm_stance && qualifies_for_stance {
             self.stats
@@ -694,6 +768,21 @@ impl SkydopplerEngine {
         let used_llm = stance
             .as_ref()
             .is_some_and(|s| s.evaluator != "structural_fallback");
+        let high_confidence_benign = used_llm
+            && stance.as_ref().is_some_and(|s| {
+                !s.collective_hostility
+                    && s.category == StormCategory::BenignViral
+                    && s.confidence >= BENIGN_CACHE_MIN_CONFIDENCE
+            });
+        if high_confidence_benign {
+            self.record_benign_verdict(
+                &candidate.focal_post_uri,
+                candidate.observed_at_us,
+                candidate.initial_metrics.unique_authors_short,
+            );
+        } else if used_llm {
+            self.clear_benign_cache_entry(&candidate.focal_post_uri);
+        }
         metrics.composite_score =
             compute_composite_score(metrics.structural_score, stance.as_ref());
 
@@ -925,6 +1014,7 @@ impl SkydopplerEngine {
     pub fn run_maintenance_tick(&self) -> Result<()> {
         let now_us = current_time_us();
         let _ = self.tracker.prune_stale(now_us);
+        self.prune_benign_cache(now_us);
 
         let resolve_cutoff = now_us.saturating_sub(duration_to_us(self.config.storm_ttl));
         for (storm_id, cell_id) in self.store.resolve_stale_storms(resolve_cutoff, now_us)? {
@@ -967,6 +1057,55 @@ impl SkydopplerEngine {
                 }
             }
         }
+    }
+
+    fn is_benign_cached(
+        &self,
+        focal_post_uri: &str,
+        observed_at_us: u64,
+        unique_authors_short: usize,
+        has_distress: bool,
+    ) -> bool {
+        if has_distress {
+            return false;
+        }
+        let guard = self.benign_cache.lock();
+        let Some(entry) = guard.get(focal_post_uri) else {
+            return false;
+        };
+        let within_ttl =
+            observed_at_us.saturating_sub(entry.suppressed_at_us) < BENIGN_CACHE_TTL_US;
+        let doubled_authors = entry.unique_authors_short > 0
+            && unique_authors_short >= entry.unique_authors_short.saturating_mul(2);
+        within_ttl && !doubled_authors
+    }
+
+    fn record_benign_verdict(
+        &self,
+        focal_post_uri: &str,
+        observed_at_us: u64,
+        unique_authors_short: usize,
+    ) {
+        let mut guard = self.benign_cache.lock();
+        insert_benign_entry(
+            &mut guard,
+            focal_post_uri.to_string(),
+            BenignCacheEntry {
+                suppressed_at_us: observed_at_us,
+                unique_authors_short,
+            },
+            BENIGN_CACHE_MAX_ENTRIES,
+        );
+    }
+
+    fn clear_benign_cache_entry(&self, focal_post_uri: &str) {
+        self.benign_cache.lock().remove(focal_post_uri);
+    }
+
+    fn prune_benign_cache(&self, now_us: u64) {
+        self.benign_cache
+            .lock()
+            .retain(|_, e| now_us.saturating_sub(e.suppressed_at_us) < BENIGN_CACHE_TTL_US);
     }
 }
 
@@ -1550,6 +1689,299 @@ mod tests {
         let legacy_json = r#"{"commits_received":100,"posts_observed":20,"hot_likes_observed":30,"cold_likes_ignored":50,"defensive_signals":2,"stage1_candidates":4,"stage1_queue_shed":0,"stage2_enrichments":4,"stage3_stance_calls":1,"storms_detected":1,"storms_escalated":0,"storms_suppressed_benign":3,"errors_encountered":0}"#;
         let restored: EngineStatsSnapshot = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(restored.stage3_stance_fallbacks, 0);
+        assert_eq!(restored.stage3_benign_cache_hits, 0);
         assert_eq!(restored.stage3_stance_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn engine_caches_high_confidence_benign_verdicts_with_bypass_and_expiry() {
+        let enricher = Arc::new(MockNetworkEnricher::new());
+        let focal_uri = "at://did:plc:benigncache/app.bsky.feed.post/3kbc";
+        let moderate_uri = "at://did:plc:moderate/app.bsky.feed.post/3kmod";
+        let lowconf_uri = "at://did:plc:lowconf/app.bsky.feed.post/3klow";
+
+        // 1. Thread with moderate hostility signal (direct_ratio = 60/121 = 0.496 >= 0.45) qualifies.
+        enricher.set_post(PostEngagementSnapshot {
+            uri: focal_uri.to_string(),
+            author_did: "did:plc:benigncache".to_string(),
+            author_handle: Some("benigncache.bsky.social".to_string()),
+            author_followers: Some(4_000),
+            text: "Opinion prompt that draws quotes".to_string(),
+            reply_count: 50,
+            repost_count: 20,
+            like_count: 100,
+            quote_count: 10,
+            ..Default::default()
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:benigncache".to_string(),
+            handle: Some("benigncache.bsky.social".to_string()),
+            followers_count: Some(4_000),
+            ..Default::default()
+        });
+
+        let high_benign_stance = Arc::new(MockStormStanceClassifier::new(StormStanceVerdict::new(
+            false,
+            0.95,
+            StormCategory::BenignViral,
+            "High-confidence benign engagement",
+            "mock-stance",
+        )));
+        let cfg = RadarConfig::default()
+            .with_min_unique_authors(6)
+            .with_enable_llm_stance(true)
+            .with_thresholds(0.35, 0.56, 0.65);
+        let engine = SkydopplerEngineBuilder::new(cfg.clone())
+            .with_enricher(enricher.clone())
+            .with_stance_classifier(high_benign_stance.clone())
+            .build()
+            .unwrap();
+
+        let t0 = current_time_us();
+        let mk_cand = |ts_us: u64, authors: usize, blocks: usize| NetworkSurgeCandidate {
+            target_did: "did:plc:benigncache".to_string(),
+            focal_post_uri: focal_uri.to_string(),
+            observed_at_us: ts_us,
+            initial_metrics: StormMetrics {
+                unique_authors_short: authors,
+                unique_oon_authors_short: authors,
+                burst_z_score: 8.0,
+                defensive_blocks: blocks,
+                ..Default::default()
+            },
+            sample_replies: vec![SampleReply {
+                author_did: "did:plc:stranger1".to_string(),
+                kind: InteractionKind::Reply,
+                post_uri: "at://did:plc:stranger1/app.bsky.feed.post/1".to_string(),
+                text_snippet: "Playful reply".to_string(),
+            }],
+            recent_quote_uris: vec![],
+        };
+
+        // 1st evaluation populates Stage 3 + benign cache.
+        assert!(engine
+            .evaluate_candidate(mk_cand(t0, 10, 0))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(high_benign_stance.call_count(), 1);
+        assert_eq!(engine.stats().snapshot().stage2_enrichments, 1);
+
+        // 2nd evaluation within 30m and <2x authors short-circuits via benign cache.
+        assert!(engine
+            .evaluate_candidate(mk_cand(t0 + 60_000_000, 15, 0))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(high_benign_stance.call_count(), 1);
+        assert_eq!(engine.stats().snapshot().stage2_enrichments, 1);
+        assert_eq!(engine.stats().snapshot().stage3_benign_cache_hits, 1);
+
+        // 3rd evaluation with >=2x authors (20 >= 10*2) bypasses cache and re-evaluates.
+        assert!(engine
+            .evaluate_candidate(mk_cand(t0 + 120_000_000, 20, 0))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(high_benign_stance.call_count(), 2);
+        assert_eq!(engine.stats().snapshot().stage2_enrichments, 2);
+
+        // 4th evaluation with <2x authors but active defensive distress bypasses cache.
+        assert!(engine
+            .evaluate_candidate(mk_cand(t0 + 180_000_000, 22, 2))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(high_benign_stance.call_count(), 3);
+
+        // 5th evaluation after >30m TTL expires and re-evaluates.
+        assert!(engine
+            .evaluate_candidate(mk_cand(
+                t0 + 180_000_000 + BENIGN_CACHE_TTL_US + 1_000_000,
+                24,
+                0
+            ))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(high_benign_stance.call_count(), 4);
+
+        // Switching to a hostile verdict clears any existing cache entry for that URI.
+        let hostile_stance = Arc::new(MockStormStanceClassifier::new(StormStanceVerdict::new(
+            true,
+            0.94,
+            StormCategory::Dogpile,
+            "Turned hostile",
+            "mock-stance",
+        )));
+        let clear_engine = SkydopplerEngineBuilder::new(cfg.clone())
+            .with_enricher(enricher.clone())
+            .with_stance_classifier(hostile_stance.clone())
+            .build()
+            .unwrap();
+        enricher.set_post(PostEngagementSnapshot {
+            uri: moderate_uri.to_string(),
+            author_did: "did:plc:moderate".to_string(),
+            author_handle: Some("moderate.bsky.social".to_string()),
+            author_followers: Some(300),
+            text: "Targeted post".to_string(),
+            reply_count: 50,
+            repost_count: 10,
+            like_count: 90,
+            quote_count: 5,
+            ..Default::default()
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:moderate".to_string(),
+            handle: Some("moderate.bsky.social".to_string()),
+            followers_count: Some(300),
+            ..Default::default()
+        });
+        clear_engine.record_benign_verdict(moderate_uri, t0, 10);
+        // Distress bypasses cache -> runs hostile classifier -> clears cached benign entry.
+        let escalated = clear_engine
+            .evaluate_candidate(NetworkSurgeCandidate {
+                target_did: "did:plc:moderate".to_string(),
+                focal_post_uri: moderate_uri.to_string(),
+                observed_at_us: t0 + 10_000_000,
+                initial_metrics: StormMetrics {
+                    unique_authors_short: 12,
+                    unique_oon_authors_short: 12,
+                    burst_z_score: 8.5,
+                    defensive_blocks: 2,
+                    ..Default::default()
+                },
+                sample_replies: vec![SampleReply {
+                    author_did: "did:plc:r1".to_string(),
+                    kind: InteractionKind::Reply,
+                    post_uri: "at://did:plc:r1/app.bsky.feed.post/1".to_string(),
+                    text_snippet: "Pile on".to_string(),
+                }],
+                recent_quote_uris: vec![],
+            })
+            .await
+            .unwrap();
+        assert!(escalated.is_some());
+        assert_eq!(hostile_stance.call_count(), 1);
+        assert!(!clear_engine.is_benign_cached(moderate_uri, t0 + 20_000_000, 12, false));
+
+        // Verify direct_ratio = 0.50 (above lowered MIN_STANCE_DIRECT_RATIO = 0.45) qualifies,
+        // and low-confidence BenignViral (0.75 < 0.90) is vetoed but NOT cached.
+        enricher.set_post(PostEngagementSnapshot {
+            uri: lowconf_uri.to_string(),
+            author_did: "did:plc:lowconf".to_string(),
+            author_handle: Some("lowconf.bsky.social".to_string()),
+            author_followers: Some(900),
+            text: "Borderline viral post".to_string(),
+            reply_count: 40,
+            repost_count: 9,
+            like_count: 90,
+            quote_count: 10,
+            ..Default::default()
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:lowconf".to_string(),
+            handle: Some("lowconf.bsky.social".to_string()),
+            followers_count: Some(900),
+            ..Default::default()
+        });
+        let lowconf_stance = Arc::new(MockStormStanceClassifier::new(StormStanceVerdict::new(
+            false,
+            0.75,
+            StormCategory::BenignViral,
+            "Likely benign",
+            "mock-stance",
+        )));
+        let lowconf_engine = SkydopplerEngineBuilder::new(cfg)
+            .with_enricher(enricher)
+            .with_stance_classifier(lowconf_stance.clone())
+            .build()
+            .unwrap();
+        let mk_low_cand = |ts_us: u64| NetworkSurgeCandidate {
+            target_did: "did:plc:lowconf".to_string(),
+            focal_post_uri: lowconf_uri.to_string(),
+            observed_at_us: ts_us,
+            initial_metrics: StormMetrics {
+                unique_authors_short: 12,
+                unique_oon_authors_short: 12,
+                burst_z_score: 7.0,
+                ..Default::default()
+            },
+            sample_replies: vec![SampleReply {
+                author_did: "did:plc:stranger2".to_string(),
+                kind: InteractionKind::Reply,
+                post_uri: "at://did:plc:stranger2/app.bsky.feed.post/1".to_string(),
+                text_snippet: "Ambiguous reply".to_string(),
+            }],
+            recent_quote_uris: vec![],
+        };
+        assert!(lowconf_engine
+            .evaluate_candidate(mk_low_cand(t0))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(lowconf_engine
+            .evaluate_candidate(mk_low_cand(t0 + 10_000_000))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(lowconf_stance.call_count(), 2);
+
+        // Maintenance tick prunes expired entries, and insert_benign_entry evicts expired/oldest.
+        engine.record_benign_verdict(
+            "at://did:plc:old/app.bsky.feed.post/1",
+            t0.saturating_sub(BENIGN_CACHE_TTL_US + 1_000_000),
+            6,
+        );
+        engine.run_maintenance_tick().unwrap();
+        assert!(!engine
+            .benign_cache
+            .lock()
+            .contains_key("at://did:plc:old/app.bsky.feed.post/1"));
+
+        let mut bounded = HashMap::new();
+        insert_benign_entry(
+            &mut bounded,
+            "u1".to_string(),
+            BenignCacheEntry {
+                suppressed_at_us: 100,
+                unique_authors_short: 6,
+            },
+            2,
+        );
+        insert_benign_entry(
+            &mut bounded,
+            "u2".to_string(),
+            BenignCacheEntry {
+                suppressed_at_us: 200,
+                unique_authors_short: 6,
+            },
+            2,
+        );
+        insert_benign_entry(
+            &mut bounded,
+            "u3".to_string(),
+            BenignCacheEntry {
+                suppressed_at_us: 300,
+                unique_authors_short: 6,
+            },
+            2,
+        );
+        assert_eq!(bounded.len(), 2);
+        assert!(!bounded.contains_key("u1"));
+        assert!(bounded.contains_key("u2"));
+        assert!(bounded.contains_key("u3"));
+
+        // Expired entry is pruned before newest entry when at capacity.
+        insert_benign_entry(
+            &mut bounded,
+            "u4".to_string(),
+            BenignCacheEntry {
+                suppressed_at_us: 300 + BENIGN_CACHE_TTL_US + 10,
+                unique_authors_short: 6,
+            },
+            2,
+        );
+        assert!(bounded.contains_key("u4"));
     }
 }
