@@ -76,20 +76,17 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --lib --no-default-features -- -D warnings
 
-# 4. Unit, Integration & Doc tests
-cargo test --all-targets
-cargo test --doc
-
-# 5. Enforce >= 92% line test coverage (matching CI nextest + llvm-cov)
+# 4. Run Unit, Integration, Coverage (>= 92%) & Doc tests in one pass
 cargo llvm-cov clean --workspace
 cargo llvm-cov nextest --all-targets --lcov --output-path lcov.info
 cargo llvm-cov report --fail-under-lines 92
 rm -f lcov.info
+cargo test --doc
 
-# 6. Mutation smoke test on critical kernels
-cargo mutants --in-place --cargo-arg --lib --file src/time.rs --file src/math.rs --file src/redact.rs
+# 5. Mutation smoke test on critical lean-core kernels
+cargo mutants --in-place --cargo-arg --no-default-features --cargo-arg --lib --file src/time.rs --file src/math.rs --file src/redact.rs
 
-# 7. Dependency & security audits
+# 6. Dependency & security audits
 cargo deny check
 cargo audit
 ```
