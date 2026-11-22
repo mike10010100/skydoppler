@@ -20,6 +20,7 @@ const NUM_SHARDS: usize = 16;
 const MAX_QUOTES_PER_POST: usize = 15;
 const MAX_UNIQUE_AUTHOR_SET: usize = 2_048;
 const MAX_KNOWN_POSTGATE_DETACHES: usize = 512;
+const MIN_QUOTES_RATIO_BYPASS: usize = 2;
 
 /// Outcome of observing a single [`JetstreamCommit`] in [`NetworkTracker::observe_commit`].
 #[derive(Debug, Clone, PartialEq)]
@@ -706,6 +707,7 @@ impl NetworkTracker {
             .saturating_add(distress.1)
             .saturating_add(distress.2);
         let has_distress = distress_total >= self.config.defensive_distress_threshold;
+        let has_quote_surge = quotes >= MIN_QUOTES_RATIO_BYPASS;
         let effective_min_authors = if has_distress {
             (self.config.min_unique_authors / 2).max(2)
         } else {
@@ -722,7 +724,7 @@ impl NetworkTracker {
         } else {
             1.0
         };
-        if !has_distress && streaming_share < self.config.min_streaming_ratio {
+        if !has_distress && !has_quote_surge && streaming_share < self.config.min_streaming_ratio {
             return None;
         }
 
@@ -745,7 +747,7 @@ impl NetworkTracker {
             distress_total,
             TargetTier::Unknown,
         );
-        if !has_distress && structural < self.config.stage1_trigger_score {
+        if !has_distress && !has_quote_surge && structural < self.config.stage1_trigger_score {
             return None;
         }
 
@@ -1078,6 +1080,82 @@ mod tests {
                 assert_eq!(cand.target_did, "did:plc:subreply");
             }
             other => panic!("expected subthread parent candidate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn quote_surge_bypasses_streaming_ratio_on_liked_post() {
+        let tracker = NetworkTracker::new(RadarConfig::default());
+        let focal_uri = "at://did:plc:likedtarget/app.bsky.feed.post/3kliked";
+
+        // Prior medium-window activity keeps short-window burst_z modest.
+        for i in 0..6 {
+            let _ = tracker.observe_commit(&mk_reply(
+                &format!("did:plc:prior{i}"),
+                "did:plc:likedtarget",
+                "3kliked",
+                300_000_000 + i,
+                "earlier reply",
+            ));
+        }
+
+        // 60 short-window live likes push streaming_share well below 0.30.
+        let short_base = 1_900_000_000_u64;
+        for i in 0..60 {
+            assert_eq!(
+                tracker.observe_commit(&mk_like(
+                    &format!("did:plc:liker{i}"),
+                    focal_uri,
+                    short_base + i,
+                )),
+                ObserveOutcome::HotEngagementUpdated
+            );
+        }
+
+        // 5 replies + 1 quote (6 unique authors, quotes == 1 < 2): blocked by streaming_ratio.
+        for i in 0..5 {
+            assert_eq!(
+                tracker.observe_commit(&mk_reply(
+                    &format!("did:plc:rep{i}"),
+                    "did:plc:likedtarget",
+                    "3kliked",
+                    short_base + 100 + i,
+                    "replying",
+                )),
+                ObserveOutcome::PostInteraction(None)
+            );
+        }
+
+        let mk_quote = |author: &str, rkey: &str, ts_us: u64| JetstreamCommit {
+            did: author.to_string(),
+            time_us: ts_us,
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: rkey.to_string(),
+            operation: CommitOperation::Create,
+            cid: None,
+            record: Some(json!({
+                "text": "Look at this post",
+                "embed": {
+                    "$type": "app.bsky.embed.record",
+                    "record": { "uri": focal_uri, "cid": "c1" }
+                }
+            })),
+        };
+
+        assert_eq!(
+            tracker.observe_commit(&mk_quote("did:plc:qt1", "q1", short_base + 200)),
+            ObserveOutcome::PostInteraction(None)
+        );
+
+        // 2nd quote from a 7th unique author triggers quote-cascade bypass for Stage 2 getQuotes.
+        match tracker.observe_commit(&mk_quote("did:plc:qt2", "q2", short_base + 201)) {
+            ObserveOutcome::PostInteraction(Some(cand)) => {
+                assert_eq!(cand.focal_post_uri, focal_uri);
+                assert_eq!(cand.initial_metrics.quote_count_short, 2);
+                assert_eq!(cand.recent_quote_uris.len(), 2);
+                assert_eq!(cand.initial_metrics.unique_authors_short, 7);
+            }
+            other => panic!("expected quote-surge candidate, got {other:?}"),
         }
     }
 }

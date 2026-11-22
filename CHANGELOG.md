@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-11-22
+
+### Changed
+
+- **Stage 1 Recall Calibration & Quote-Cascade Bypass (`src/types.rs`, `src/tracker.rs`, `.env.example`)**:
+  - Extended default `DEFAULT_SHORT_WINDOW_SECS` (`300s` -> `600s`), lowered `DEFAULT_MIN_UNIQUE_AUTHORS` (`8` -> `6`), and lowered `DEFAULT_MIN_STREAMING_RATIO` (`0.50` -> `0.30`) to catch medium-paced dogpiles and ratio cascades on popular posts.
+  - Added a `>= 2` short-window quote-post cascade bypass (`MIN_QUOTES_RATIO_BYPASS`) of `min_streaming_ratio` and `stage1_trigger_score` so liked posts suddenly drawing quote-dunks still reach Stage 2 `getQuotes` enrichment.
+- **Stage 2/3 Direct-Ratio Calibration (`src/engine.rs`)**:
+  - Lowered `MIN_STANCE_DIRECT_RATIO` (`0.60` -> `0.45`) so dogpiles on moderately liked posts can advance to Stage 3 LLM stance verification while keeping beloved high-like viral posts (`< 0.45`) filtered out.
+
+### Added
+
+- **Bounded Stage 2/3 Benign-Verdict Suppression Cache (`src/engine.rs`, `src/web/api.rs`)**:
+  - Added an in-memory bounded 30-minute suppression cache (`BENIGN_CACHE_TTL_US`, `BENIGN_CACHE_MIN_CONFIDENCE = 0.90`, `BENIGN_CACHE_MAX_ENTRIES = 4096`) short-circuiting repeat AppView/LLM re-evaluations on confirmed benign viral threads, automatically bypassed on `2x` author growth or target defensive distress and pruned on maintenance ticks.
+  - Exported backward-compatible `stage3_benign_cache_hits` telemetry (`#[serde(default)]`) as `skydoppler_stage3_benign_cache_hits_total` on `/metrics`.
+
 ## [0.2.2] - 2026-11-21
 
 ### Fixed
