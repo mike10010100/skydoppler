@@ -42,7 +42,7 @@ Both crate roots enforce:
 - Test modules (`#[cfg(test)]` / `tests/`) may permit unwrap/expect via explicit local `#[allow(...)]`.
 
 ### 4. Fail-Closed Small-Account Redaction Invariant
-- Public REST and SSE views ([`src/redact.rs`](src/redact.rs)) must NEVER expose PII, handles, DIDs, post URIs, snippets, or amplifying catalyst links for targets with fewer than `public_follower_threshold` followers (default `5000`) **or unknown follower count (`None`)**.
+- Public REST and SSE views ([`src/redact.rs`](src/redact.rs)) must NEVER expose PII, handles, DIDs, post URIs, snippets, or amplifying catalyst links for targets with fewer than `public_follower_threshold` followers (default `20`) **or unknown follower count (`None`)**.
 - Redaction must be enforced at the type boundary (`PublicStormView` vs `OperatorStormView`), never via ad-hoc template filtering.
 
 ### 5. Bounded Firehose Memory, Concurrency & Time Safety

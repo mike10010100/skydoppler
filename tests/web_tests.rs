@@ -24,13 +24,13 @@ const OPERATOR_SECRET: &str = "super_secret_doppler_operator_2026";
 fn setup_test_engine() -> Arc<SkydopplerEngine> {
     let enricher = Arc::new(MockNetworkEnricher::new());
 
-    // 1. Small account (< 5,000 followers)
+    // 1. Small account (< 20 followers)
     let small_uri = "at://did:plc:small123/app.bsky.feed.post/3ksmall";
     enricher.set_post(PostEngagementSnapshot {
         uri: small_uri.to_string(),
         author_did: "did:plc:small123".to_string(),
         author_handle: Some("small123.bsky.social".to_string()),
-        author_followers: Some(310),
+        author_followers: Some(12),
         text: "Private rant snippet that must never leak publicly".to_string(),
         reply_count: 50,
         repost_count: 0,
@@ -41,7 +41,7 @@ fn setup_test_engine() -> Arc<SkydopplerEngine> {
     enricher.set_profile(ActorSummary {
         did: "did:plc:small123".to_string(),
         handle: Some("small123.bsky.social".to_string()),
-        followers_count: Some(310),
+        followers_count: Some(12),
         ..Default::default()
     });
     enricher.set_post(PostEngagementSnapshot {
@@ -57,7 +57,7 @@ fn setup_test_engine() -> Arc<SkydopplerEngine> {
         ..Default::default()
     });
 
-    // 2. Public figure (>= 5,000 followers)
+    // 2. Public figure (>= 20 followers)
     let big_uri = "at://did:plc:public777/app.bsky.feed.post/3kpub777";
     enricher.set_post(PostEngagementSnapshot {
         uri: big_uri.to_string(),
@@ -189,6 +189,7 @@ async fn dashboard_health_metrics_weather_redaction_operator_auth_and_dismiss() 
     assert!(html.contains("doppler-canvas"));
     assert!(html.contains("escapeHtml"));
     assert!(html.contains("Protected Small Account"));
+    assert!(html.contains("&lt; 20 followers"));
     assert!(html.contains("encodeBskyActor"));
     assert!(html.contains("replace(/%3A/gi, ':')"));
 

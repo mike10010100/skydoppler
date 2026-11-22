@@ -21,7 +21,7 @@ pub const DEFAULT_MAX_TRACKED_POSTS: usize = 40_000;
 /// Default hard cap on concurrently tracked target authors for defensive distress bursts.
 pub const DEFAULT_MAX_TRACKED_AUTHORS: usize = 20_000;
 /// Default follower threshold below which (or when unknown) public storm targets are redacted.
-pub const DEFAULT_PUBLIC_FOLLOWER_THRESHOLD: u64 = 5_000;
+pub const DEFAULT_PUBLIC_FOLLOWER_THRESHOLD: u64 = 20;
 
 /// Configuration governing `skydoppler` detection windows, thresholds, redaction, and retention.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -789,7 +789,7 @@ pub struct WeatherSummary {
     pub high_storms: usize,
     /// Active `Elevated` storm cells.
     pub elevated_storms: usize,
-    /// Active storms targeting protected small accounts (`target_tier == Small | Unknown`).
+    /// Active storms redacted publicly under `public_follower_threshold` (or unknown followers).
     pub small_target_storms: usize,
     /// Active storms classified as `PublicFigureBacklash`.
     pub public_figure_backlashes: usize,

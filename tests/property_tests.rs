@@ -72,7 +72,7 @@ proptest! {
         handle in "[a-z]{6,12}",
         snippet in "[A-Za-z0-9]{12,24}",
         cat_handle in "[a-z]{6,12}",
-        threshold in 100_u64..=50_000,
+        threshold in 1_u64..=50_000,
         below_offset in 1_u64..=50_000,
         use_none in any::<bool>(),
     ) {
