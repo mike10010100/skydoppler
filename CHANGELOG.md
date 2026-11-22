@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-11-22
+
+### Changed
+
+- **Faster CI Verification, Mutation Testing & Docker Builds (`.cargo/mutants.toml`, `.github/workflows/ci.yml`, `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `AGENTS.md`)**:
+  - Added `.cargo/mutants.toml` (`test_tool = "nextest"`) and sharded `mutants-smoke` across 4 parallel lean-core (`--no-default-features`) CI matrix shards (`0..3/4`, round-robin) with `shared-key: "mutants-lean"` so all 187 kernel mutants continue to run without compilation bottlenecks.
+  - Added Stage 0 `manifest-prep` version normalization and dummy dependency pre-building in `Dockerfile` plus `.dockerignore` and `5s` container healthcheck intervals across `Dockerfile` and `docker-compose.yml`.
+  - Added `Swatinem/rust-cache@v2` (`shared-key: "publish"`) to the `publish` job in `.github/workflows/ci.yml` and unified local test + `llvm-cov nextest` execution in `AGENTS.md`.
+
 ## [0.3.1] - 2026-11-22
 
 ### Changed

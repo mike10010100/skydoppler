@@ -117,9 +117,13 @@ jobs:
         run: cargo test --doc
 
   mutants-smoke:
-    name: Mutation Testing Smoke Test
+    name: Mutation Testing Smoke (${{ matrix.shard }}/4)
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
       - name: Checkout skydoppler
         uses: actions/checkout@v7
@@ -132,7 +136,7 @@ jobs:
       - name: Enable Rust Cache
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: "mutants"
+          shared-key: "mutants-lean"
           cache-all-crates: true
           cache-on-failure: true
 
@@ -142,7 +146,7 @@ jobs:
           tool: cargo-nextest,cargo-mutants
 
       - name: 7. Mutation Testing Smoke Test (cargo-mutants)
-        run: cargo mutants --in-place --cargo-arg --lib --file src/time.rs --file src/math.rs --file src/redact.rs
+        run: cargo mutants --in-place --shard ${{ matrix.shard }}/4 --sharding round-robin --cargo-arg --no-default-features --cargo-arg --lib --file src/time.rs --file src/math.rs --file src/redact.rs
 
   quality-gate:
     name: Rust Quality Gate
@@ -189,6 +193,12 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Enable Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "publish"
+          cache-on-failure: true
 
       - name: Extract Current Version & Name
         id: pkg_info

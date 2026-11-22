@@ -3,6 +3,14 @@
 # Network-Wide Bluesky Atmospheric Dogpile Radar
 # ==============================================================================
 
+# Stage 0: Normalize package version in manifests so version bumps (e.g. 0.3.1 -> 0.3.2)
+# produce identical manifest checksums and preserve the compiled dependency layer cache.
+FROM debian:bookworm-slim AS manifest-prep
+WORKDIR /manifests
+COPY Cargo.toml Cargo.lock ./
+RUN sed -i '0,/^version = ".*"/s//version = "0.0.1"/' Cargo.toml && \
+    sed -i '/^name = "skydoppler"$/{n;s/^version = ".*"/version = "0.0.1"/;}' Cargo.lock
+
 # ------------------------------------------------------------------------------
 # Stage 1: Build Release Binary
 # ------------------------------------------------------------------------------
@@ -10,16 +18,27 @@ FROM rust:1-bookworm AS builder
 
 WORKDIR /build
 
-# Copy manifests; skybase is fetched from crates.io.
-COPY Cargo.toml Cargo.lock ./
+# Copy version-normalized manifests; skybase is fetched from crates.io.
+COPY --from=manifest-prep /manifests/Cargo.toml /manifests/Cargo.lock ./
 
-# Copy application source, embedded assets, and example manifest targets
+# Pre-build third-party dependencies using valid dummy sources so app edits & version bumps reuse this layer.
+RUN mkdir -p src examples && \
+    echo "pub fn main() {}" > src/main.rs && \
+    echo "" > src/lib.rs && \
+    echo "fn main() {}" > examples/live_radar_soak.rs && \
+    cargo build --release --locked --bin skydoppler && \
+    rm -rf src examples
+
+# Copy real manifests, application source, embedded assets, and example manifest targets
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY assets ./assets
 COPY examples ./examples
 
-# Build optimized production binary and strip debug symbols
-RUN cargo build --release --locked --bin skydoppler && \
+# Build optimized production binary (clean dummy crate artifacts so real code is compiled) and strip debug symbols
+RUN rm -rf target/release/deps/skydoppler* target/release/deps/libskydoppler* \
+           target/release/skydoppler* target/release/.fingerprint/skydoppler-* && \
+    cargo build --release --locked --bin skydoppler && \
     strip /build/target/release/skydoppler
 
 # ------------------------------------------------------------------------------
@@ -62,7 +81,7 @@ ENV HOST=0.0.0.0 \
 
 EXPOSE 3000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=5s --timeout=5s --start-period=15s --retries=3 \
     CMD curl -f http://localhost:3000/healthz || exit 1
 
 ENTRYPOINT ["/usr/local/bin/skydoppler"]
