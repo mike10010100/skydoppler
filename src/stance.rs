@@ -25,6 +25,10 @@ pub enum StanceDialect {
     StandardJev,
 }
 
+/// Default Ollama context window size (`num_ctx`) for Stage 3 stance classification,
+/// aligned with sibling `skybouncer` (`16384`) to avoid KV-cache runner reloads on shared Ollama hosts.
+pub const DEFAULT_STANCE_NUM_CTX: u32 = 16_384;
+
 /// Configuration for [`LlmStormStanceClassifier`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StanceConfig {
@@ -50,7 +54,7 @@ impl Default for StanceConfig {
             model: "qwen3.5:9b".to_string(),
             timeout: Duration::from_secs(30),
             max_retries: 1,
-            num_ctx: 4096,
+            num_ctx: DEFAULT_STANCE_NUM_CTX,
         }
     }
 }
@@ -764,6 +768,7 @@ mod tests {
         let ollama_reqs = ollama.received_requests().await.unwrap();
         let req_json: serde_json::Value = serde_json::from_slice(&ollama_reqs[0].body).unwrap();
         assert_eq!(req_json["think"], serde_json::json!(false));
+        assert_eq!(req_json["options"]["num_ctx"], serde_json::json!(16384));
         assert_eq!(req_json["format"]["type"], serde_json::json!("object"));
         assert!(req_json["format"]["properties"]["hostility_directed_at_author"].is_object());
         let prompt_str = LlmStormStanceClassifier::format_bundle_prompt(&sample_input());

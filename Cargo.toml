@@ -1,6 +1,6 @@
 [package]
 name = "skydoppler"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 rust-version = "1.89"
 authors = ["Michael Paulauski <mike10010100@gmail.com>"]
@@ -40,7 +40,7 @@ telemetry = ["dep:tracing-subscriber"]
 
 [dependencies]
 # AT Protocol primitives, Jetstream ingest & AppView client from crates.io.
-skybase = { version = "0.1.11", default-features = false }
+skybase = { version = "0.1.12", default-features = false }
 
 # HTTP Web Framework & Async Streams
 axum = { version = "0.8", optional = true, default-features = false, features = ["json", "query", "tokio", "macros", "http1"] }
