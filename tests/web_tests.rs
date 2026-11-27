@@ -230,6 +230,7 @@ async fn dashboard_health_metrics_weather_redaction_operator_auth_and_dismiss() 
         assert!(txt.contains("skydoppler_stage3_benign_cache_hits_total"));
         assert!(txt.contains("skydoppler_storms_detected_total 2"));
         assert!(txt.contains("skydoppler_active_storms 2"));
+        assert!(txt.contains("skydoppler_tracked_quotes"));
         assert!(txt.contains("skydoppler_weather_index"));
         assert!(txt.contains("skydoppler_build_info"));
     }

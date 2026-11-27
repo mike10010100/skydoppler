@@ -35,6 +35,9 @@ use crate::types::{
 const STATS_META_KEY: &str = "engine_stats_v1";
 const MIN_CATALYST_ENGAGEMENT: u64 = 5;
 const MIN_CATALYST_DUNK_RATIO: f64 = 0.50;
+const MIN_STRONG_CATALYST_LIKES: u64 = 15;
+const MIN_STRONG_CATALYST_DUNK_RATIO: f64 = 2.0;
+const MIN_STRONG_CATALYST_OON_AUTHORS: usize = 2;
 const MIN_STANCE_STRUCTURAL_SCORE: f64 = 0.30;
 const MIN_STANCE_OON_RATIO: f64 = 0.25;
 const MIN_STANCE_DIRECT_RATIO: f64 = 0.45;
@@ -488,6 +491,12 @@ impl SkydopplerEngine {
                     .fetch_add(1, Ordering::Relaxed);
                 None
             }
+            ObserveOutcome::CatalystDunk(cand) => {
+                self.stats
+                    .hot_likes_observed
+                    .fetch_add(1, Ordering::Relaxed);
+                Some(cand)
+            }
             ObserveOutcome::DefensiveSignal(maybe_c) => {
                 self.stats.defensive_signals.fetch_add(1, Ordering::Relaxed);
                 maybe_c
@@ -521,11 +530,15 @@ impl SkydopplerEngine {
             .saturating_add(candidate.initial_metrics.defensive_threadgates);
         let initial_has_distress =
             initial_distress_total >= self.config.defensive_distress_threshold;
+        let activity_authors = candidate
+            .initial_metrics
+            .unique_authors_short
+            .max(candidate.initial_metrics.unique_authors_medium);
         if self.config.enable_llm_stance
             && self.is_benign_cached(
                 &candidate.focal_post_uri,
                 candidate.observed_at_us,
-                candidate.initial_metrics.unique_authors_short,
+                activity_authors,
                 initial_has_distress,
             )
         {
@@ -537,7 +550,7 @@ impl SkydopplerEngine {
                 .fetch_add(1, Ordering::Relaxed);
             debug!(
                 cell = %cell_id,
-                authors = candidate.initial_metrics.unique_authors_short,
+                authors = activity_authors,
                 "Stage 2/3 candidate suppressed by benign verdict cache"
             );
             return Ok(None);
@@ -628,13 +641,19 @@ impl SkydopplerEngine {
             .await;
 
         let mut metrics = candidate.initial_metrics.clone();
+        let mut unique_oon_authors_medium = metrics.unique_authors_medium;
         if !rels.is_empty() {
             let oon_sampled = rels.iter().filter(|r| r.is_out_of_network()).count();
             let ratio = (oon_sampled as f64) / (rels.len() as f64);
             metrics.out_of_network_ratio = ratio;
             metrics.unique_oon_authors_short =
                 ((metrics.unique_authors_short as f64) * ratio).round() as usize;
+            unique_oon_authors_medium =
+                ((metrics.unique_authors_medium as f64) * ratio).round() as usize;
         }
+        let effective_oon_authors = metrics
+            .unique_oon_authors_short
+            .max(unique_oon_authors_medium);
 
         if let Some(ref fp) = focal_post {
             metrics.direct_ratio = compute_direct_ratio(
@@ -678,7 +697,7 @@ impl SkydopplerEngine {
             .saturating_add(metrics.defensive_threadgates);
         metrics.vulnerability_weight = compute_vulnerability_weight(target_tier);
         metrics.structural_score = compute_structural_score(
-            metrics.unique_oon_authors_short,
+            effective_oon_authors,
             metrics.out_of_network_ratio,
             metrics.direct_ratio,
             metrics.dunk_ratio,
@@ -688,14 +707,35 @@ impl SkydopplerEngine {
             target_tier,
         );
 
-        let min_oon_authors = match target_tier {
+        let min_oon_authors_short = match target_tier {
             TargetTier::Large | TargetTier::PublicFigure => self.config.min_unique_authors,
             TargetTier::Small | TargetTier::Mid | TargetTier::Unknown => {
                 (self.config.min_unique_authors / 2).max(2)
             }
         };
+        let effective_min_med = self
+            .config
+            .min_unique_authors_medium
+            .max(self.config.min_unique_authors);
+        let min_oon_authors_medium = match target_tier {
+            TargetTier::Large | TargetTier::PublicFigure => effective_min_med,
+            TargetTier::Small | TargetTier::Mid | TargetTier::Unknown => {
+                (effective_min_med / 2).max(min_oon_authors_short)
+            }
+        };
         let has_distress = distress_total >= self.config.defensive_distress_threshold;
-        let has_sufficient_oon = metrics.unique_oon_authors_short >= min_oon_authors
+        let has_strong_catalyst_dunk = matches!(
+            target_tier,
+            TargetTier::Small | TargetTier::Mid | TargetTier::Unknown
+        ) && top_catalyst.as_ref().is_some_and(|c| {
+            c.like_count >= MIN_STRONG_CATALYST_LIKES
+                && c.dunk_ratio >= MIN_STRONG_CATALYST_DUNK_RATIO
+        }) && effective_oon_authors
+            >= MIN_STRONG_CATALYST_OON_AUTHORS
+            && metrics.out_of_network_ratio >= MIN_STANCE_OON_RATIO;
+        let has_sufficient_oon = (metrics.unique_oon_authors_short >= min_oon_authors_short
+            || unique_oon_authors_medium >= min_oon_authors_medium
+            || has_strong_catalyst_dunk)
             && metrics.out_of_network_ratio >= MIN_STANCE_OON_RATIO;
         let has_hostile_signal = metrics.direct_ratio >= MIN_STANCE_DIRECT_RATIO
             || metrics.dunk_ratio >= MIN_STANCE_DUNK_RATIO
@@ -730,7 +770,7 @@ impl SkydopplerEngine {
                         category = %v.category,
                         hostile = v.collective_hostility,
                         confidence = %format!("{:.2}", v.confidence),
-                        oon_authors = metrics.unique_oon_authors_short,
+                        oon_authors = effective_oon_authors,
                         direct_ratio = %format!("{:.2}", metrics.direct_ratio),
                         dunk_ratio = %format!("{:.2}", metrics.dunk_ratio),
                         structural = %format!("{:.3}", metrics.structural_score),
@@ -778,7 +818,7 @@ impl SkydopplerEngine {
             self.record_benign_verdict(
                 &candidate.focal_post_uri,
                 candidate.observed_at_us,
-                candidate.initial_metrics.unique_authors_short,
+                activity_authors,
             );
         } else if used_llm {
             self.clear_benign_cache_entry(&candidate.focal_post_uri);
@@ -807,7 +847,7 @@ impl SkydopplerEngine {
             debug!(
                 cell = %cell_id,
                 tier = %target_tier,
-                oon_authors = metrics.unique_oon_authors_short,
+                oon_authors = effective_oon_authors,
                 oon_ratio = %format!("{:.2}", metrics.out_of_network_ratio),
                 direct_ratio = %format!("{:.2}", metrics.direct_ratio),
                 dunk_ratio = %format!("{:.2}", metrics.dunk_ratio),
@@ -1983,5 +2023,208 @@ mod tests {
             2,
         );
         assert!(bounded.contains_key("u4"));
+    }
+
+    #[tokio::test]
+    async fn engine_confirms_slow_burn_medium_window_and_catalyst_dunk_dogpiles() {
+        let enricher = Arc::new(MockNetworkEnricher::new());
+
+        // 1) Slow-burn Small target: 2 short / 8 medium authors, direct_ratio=3.15
+        let slow_uri = "at://did:plc:slow_e/app.bsky.feed.post/3kslow_e";
+        enricher.set_post(PostEngagementSnapshot {
+            uri: slow_uri.to_string(),
+            author_did: "did:plc:slow_e".to_string(),
+            author_handle: Some("slowe.bsky.social".to_string()),
+            author_followers: Some(369),
+            text: "Why are we seeing silence?".to_string(),
+            reply_count: 39,
+            repost_count: 0,
+            like_count: 12,
+            quote_count: 2,
+            ..Default::default()
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:slow_e".to_string(),
+            handle: Some("slowe.bsky.social".to_string()),
+            followers_count: Some(369),
+            ..Default::default()
+        });
+
+        // 2) Catalyst-dunk Small target: 2 OON authors + 60-like catalyst quote (dunk_ratio=4.62)
+        let cat_uri = "at://did:plc:cat_e/app.bsky.feed.post/3kcat_e";
+        let cat_qt_uri = "at://did:plc:bigdunk_e/app.bsky.feed.post/3kqt_e";
+        enricher.set_post(PostEngagementSnapshot {
+            uri: cat_uri.to_string(),
+            author_did: "did:plc:cat_e".to_string(),
+            author_handle: Some("cate.bsky.social".to_string()),
+            author_followers: Some(250),
+            text: "Targeted hot take".to_string(),
+            reply_count: 5,
+            repost_count: 0,
+            like_count: 12,
+            quote_count: 1,
+            ..Default::default()
+        });
+        enricher.set_post(PostEngagementSnapshot {
+            uri: cat_qt_uri.to_string(),
+            author_did: "did:plc:bigdunk_e".to_string(),
+            author_handle: Some("bigdunk.bsky.social".to_string()),
+            author_followers: Some(25_000),
+            text: "Look at this nonsense".to_string(),
+            reply_count: 2,
+            repost_count: 8,
+            like_count: 60,
+            quote_count: 0,
+            ..Default::default()
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:cat_e".to_string(),
+            handle: Some("cate.bsky.social".to_string()),
+            followers_count: Some(250),
+            ..Default::default()
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:bigdunk_e".to_string(),
+            handle: Some("bigdunk.bsky.social".to_string()),
+            followers_count: Some(25_000),
+            ..Default::default()
+        });
+
+        // 3) PublicFigure with only 2 OON authors + catalyst dunk stays gated before Stage 3.
+        let pub_uri = "at://did:plc:pub_e/app.bsky.feed.post/3kpub_e";
+        let pub_qt_uri = "at://did:plc:pubqt_e/app.bsky.feed.post/3kpubqt_e";
+        enricher.set_post(PostEngagementSnapshot {
+            uri: pub_uri.to_string(),
+            author_did: "did:plc:pub_e".to_string(),
+            author_handle: Some("celeb.bsky.social".to_string()),
+            author_followers: Some(400_000),
+            text: "Public figure post".to_string(),
+            reply_count: 4,
+            repost_count: 0,
+            like_count: 5,
+            quote_count: 1,
+            ..Default::default()
+        });
+        enricher.set_post(PostEngagementSnapshot {
+            uri: pub_qt_uri.to_string(),
+            author_did: "did:plc:pubqt_e".to_string(),
+            author_handle: Some("commenter.bsky.social".to_string()),
+            author_followers: Some(50_000),
+            text: "Ratio".to_string(),
+            like_count: 50,
+            repost_count: 3,
+            ..Default::default()
+        });
+        enricher.set_profile(ActorSummary {
+            did: "did:plc:pub_e".to_string(),
+            handle: Some("celeb.bsky.social".to_string()),
+            followers_count: Some(400_000),
+            ..Default::default()
+        });
+
+        let stance = Arc::new(MockStormStanceClassifier::new(StormStanceVerdict::new(
+            true,
+            0.93,
+            StormCategory::Dogpile,
+            "Hostile crowd dogpile",
+            "mock-stance",
+        )));
+        let engine = SkydopplerEngineBuilder::new(
+            RadarConfig::default()
+                .with_min_unique_authors(6)
+                .with_min_unique_authors_medium(8)
+                .with_enable_llm_stance(true),
+        )
+        .with_enricher(enricher)
+        .with_stance_classifier(stance.clone())
+        .build()
+        .unwrap();
+
+        let slow_storm = engine
+            .evaluate_candidate(NetworkSurgeCandidate {
+                target_did: "did:plc:slow_e".to_string(),
+                focal_post_uri: slow_uri.to_string(),
+                observed_at_us: current_time_us(),
+                initial_metrics: StormMetrics {
+                    unique_authors_short: 2,
+                    unique_authors_medium: 8,
+                    unique_oon_authors_short: 2,
+                    burst_z_score: 4.5,
+                    ..Default::default()
+                },
+                sample_replies: vec![SampleReply {
+                    author_did: "did:plc:s_oon1".to_string(),
+                    kind: InteractionKind::Reply,
+                    post_uri: "at://did:plc:s_oon1/app.bsky.feed.post/1".to_string(),
+                    text_snippet: "Mocking reply".to_string(),
+                }],
+                recent_quote_uris: vec![],
+            })
+            .await
+            .unwrap()
+            .expect("slow-burn medium-window dogpile should confirm");
+        assert_eq!(slow_storm.category, StormCategory::Dogpile);
+        assert_eq!(slow_storm.metrics.unique_authors_medium, 8);
+        assert_eq!(stance.call_count(), 1);
+
+        let cat_storm = engine
+            .evaluate_candidate(NetworkSurgeCandidate {
+                target_did: "did:plc:cat_e".to_string(),
+                focal_post_uri: cat_uri.to_string(),
+                observed_at_us: current_time_us(),
+                initial_metrics: StormMetrics {
+                    unique_authors_short: 2,
+                    unique_authors_medium: 2,
+                    unique_oon_authors_short: 2,
+                    burst_z_score: 3.0,
+                    dunk_ratio: 4.6,
+                    ..Default::default()
+                },
+                sample_replies: vec![SampleReply {
+                    author_did: "did:plc:c_oon1".to_string(),
+                    kind: InteractionKind::Reply,
+                    post_uri: "at://did:plc:c_oon1/app.bsky.feed.post/1".to_string(),
+                    text_snippet: "Dunk reply".to_string(),
+                }],
+                recent_quote_uris: vec![cat_qt_uri.to_string()],
+            })
+            .await
+            .unwrap()
+            .expect("catalyst-dunk small account dogpile should confirm");
+        assert_eq!(cat_storm.category, StormCategory::Dogpile);
+        assert!(cat_storm.top_catalyst.is_some());
+        assert_eq!(stance.call_count(), 2);
+
+        // PublicFigure with only 2 OON authors stays gated before Stage 3.
+        let gated_pub = engine
+            .evaluate_candidate(NetworkSurgeCandidate {
+                target_did: "did:plc:pub_e".to_string(),
+                focal_post_uri: pub_uri.to_string(),
+                observed_at_us: current_time_us(),
+                initial_metrics: StormMetrics {
+                    unique_authors_short: 2,
+                    unique_authors_medium: 2,
+                    unique_oon_authors_short: 2,
+                    burst_z_score: 3.0,
+                    dunk_ratio: 8.3,
+                    ..Default::default()
+                },
+                sample_replies: vec![SampleReply {
+                    author_did: "did:plc:p_oon1".to_string(),
+                    kind: InteractionKind::Reply,
+                    post_uri: "at://did:plc:p_oon1/app.bsky.feed.post/1".to_string(),
+                    text_snippet: "Ratio".to_string(),
+                }],
+                recent_quote_uris: vec![pub_qt_uri.to_string()],
+            })
+            .await
+            .unwrap();
+        assert!(gated_pub.is_none());
+        assert_eq!(stance.call_count(), 2);
+
+        // Legacy StormMetrics JSON without `unique_authors_medium` deserializes cleanly.
+        let legacy_metrics_json = r#"{"unique_authors_short":6,"unique_oon_authors_short":6,"reply_count_short":6,"quote_count_short":0,"streaming_likes_short":0,"streaming_reposts_short":0,"out_of_network_ratio":1.0,"direct_ratio":6.0,"dunk_ratio":0.0,"power_asymmetry":1.0,"burst_z_score":5.0,"defensive_blocks":0,"defensive_detaches":0,"defensive_threadgates":0,"vulnerability_weight":1.15,"structural_score":0.7,"composite_score":0.8}"#;
+        let legacy_metrics: StormMetrics = serde_json::from_str(legacy_metrics_json).unwrap();
+        assert_eq!(legacy_metrics.unique_authors_medium, 0);
     }
 }

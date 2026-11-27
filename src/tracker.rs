@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use parking_lot::Mutex;
 use skybase::ingest::events::{CommitOperation, JetstreamCommit};
 
-use crate::math::{compute_burst_acceleration, compute_direct_ratio, compute_structural_score};
+use crate::math::{
+    compute_burst_acceleration, compute_direct_ratio, compute_dunk_ratio, compute_structural_score,
+};
 use crate::time::duration_to_us;
 use crate::types::{
     InteractionKind, NetworkSurgeCandidate, RadarConfig, SampleReply, StormMetrics, TargetTier,
@@ -21,6 +23,12 @@ const MAX_QUOTES_PER_POST: usize = 15;
 const MAX_UNIQUE_AUTHOR_SET: usize = 2_048;
 const MAX_KNOWN_POSTGATE_DETACHES: usize = 512;
 const MIN_QUOTES_RATIO_BYPASS: usize = 2;
+const MIN_SHORT_AUTHORS_FOR_MEDIUM_BURN: usize = 2;
+const MIN_SUSTAINED_STREAMING_RATIO: f64 = 0.45;
+const MIN_CATALYST_AUTHORS: usize = 2;
+const MIN_CATALYST_STREAMING_DUNK_RATIO: f64 = 2.0;
+const CATALYST_RETRY_LIKE_STEP: usize = 5;
+const MAX_LIVE_ENGAGEMENT_EVENTS: usize = 4_096;
 
 /// Outcome of observing a single [`JetstreamCommit`] in [`NetworkTracker::observe_commit`].
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +39,8 @@ pub enum ObserveOutcome {
     PostInteraction(Option<NetworkSurgeCandidate>),
     /// Like or repost hit an already-tracked hot post or catalyst QT.
     HotEngagementUpdated,
+    /// Like on a tracked quote-post catalyst triggered a Stage 1 dunk candidate for the quoted focal post.
+    CatalystDunk(NetworkSurgeCandidate),
     /// Target defensive block, postgate detach, or threadgate lock observed.
     DefensiveSignal(Option<NetworkSurgeCandidate>),
 }
@@ -53,6 +63,8 @@ struct PostBucket {
     sample_authors: HashSet<String>,
     live_likes: VecDeque<u64>,
     live_reposts: VecDeque<u64>,
+    catalyst_likes_medium: usize,
+    catalyst_likes_updated_us: u64,
     last_emitted_us: Option<u64>,
     last_emitted_authors: usize,
 }
@@ -69,6 +81,8 @@ impl PostBucket {
             sample_authors: HashSet::new(),
             live_likes: VecDeque::new(),
             live_reposts: VecDeque::new(),
+            catalyst_likes_medium: 0,
+            catalyst_likes_updated_us: 0,
             last_emitted_us: None,
             last_emitted_authors: 0,
         }
@@ -96,14 +110,18 @@ impl PostBucket {
         {
             self.live_reposts.pop_front();
         }
+        if self.catalyst_likes_updated_us < medium_cutoff_us {
+            self.catalyst_likes_medium = 0;
+            self.catalyst_likes_updated_us = 0;
+        }
     }
 
-    fn count_short(&self, short_cutoff_us: u64) -> (usize, usize, usize, usize, usize) {
+    fn count_since(&self, cutoff_us: u64) -> (usize, usize, usize, usize, usize) {
         let mut unique_authors = HashSet::new();
         let mut replies = 0usize;
         let mut quotes = 0usize;
         for ev in self.events.iter().rev() {
-            if ev.timestamp_us < short_cutoff_us {
+            if ev.timestamp_us < cutoff_us {
                 break;
             }
             if unique_authors.len() < MAX_UNIQUE_AUTHOR_SET {
@@ -118,16 +136,75 @@ impl PostBucket {
             .live_likes
             .iter()
             .rev()
-            .take_while(|&&ts| ts >= short_cutoff_us)
+            .take_while(|&&ts| ts >= cutoff_us)
             .count();
         let reposts = self
             .live_reposts
             .iter()
             .rev()
-            .take_while(|&&ts| ts >= short_cutoff_us)
+            .take_while(|&&ts| ts >= cutoff_us)
             .count();
         (unique_authors.len(), replies, quotes, likes, reposts)
     }
+}
+
+#[derive(Debug)]
+struct CatalystQuoteBucket {
+    focal_post_uri: String,
+    quote_author_did: String,
+    last_seen_us: u64,
+    live_likes: VecDeque<u64>,
+    live_reposts: VecDeque<u64>,
+    last_triggered_likes: usize,
+    last_attempt_likes: usize,
+}
+
+impl CatalystQuoteBucket {
+    fn new(focal_post_uri: String, quote_author_did: String, now_us: u64) -> Self {
+        Self {
+            focal_post_uri,
+            quote_author_did,
+            last_seen_us: now_us,
+            live_likes: VecDeque::new(),
+            live_reposts: VecDeque::new(),
+            last_triggered_likes: 0,
+            last_attempt_likes: 0,
+        }
+    }
+
+    fn prune(&mut self, medium_cutoff_us: u64) {
+        while self
+            .live_likes
+            .front()
+            .is_some_and(|&ts| ts < medium_cutoff_us)
+        {
+            self.live_likes.pop_front();
+        }
+        while self
+            .live_reposts
+            .front()
+            .is_some_and(|&ts| ts < medium_cutoff_us)
+        {
+            self.live_reposts.pop_front();
+        }
+        if self.live_likes.is_empty() {
+            self.last_triggered_likes = 0;
+            self.last_attempt_likes = 0;
+        }
+    }
+
+    fn likes_since(&self, cutoff_us: u64) -> usize {
+        self.live_likes
+            .iter()
+            .rev()
+            .take_while(|&&ts| ts >= cutoff_us)
+            .count()
+    }
+}
+
+#[derive(Debug, Default)]
+struct QuoteShard {
+    quotes: HashMap<String, CatalystQuoteBucket>,
 }
 
 #[derive(Debug)]
@@ -211,6 +288,8 @@ pub struct TrackerSnapshot {
     pub tracked_posts: usize,
     /// Total authors currently held across all 16 defensive-distress shards.
     pub tracked_authors: usize,
+    /// Total catalyst quote-posts currently indexed across all 16 quote shards.
+    pub tracked_quotes: usize,
 }
 
 fn shard_idx(key: &str) -> usize {
@@ -239,8 +318,10 @@ pub struct NetworkTracker {
     config: RadarConfig,
     post_shards: Vec<Mutex<PostShard>>,
     author_shards: Vec<Mutex<AuthorShard>>,
+    quote_shards: Vec<Mutex<QuoteShard>>,
     tracked_posts_total: AtomicUsize,
     tracked_authors_total: AtomicUsize,
+    tracked_quotes_total: AtomicUsize,
 }
 
 impl NetworkTracker {
@@ -255,12 +336,17 @@ impl NetworkTracker {
         let author_shards = (0..NUM_SHARDS)
             .map(|_| Mutex::new(AuthorShard::default()))
             .collect();
+        let quote_shards = (0..NUM_SHARDS)
+            .map(|_| Mutex::new(QuoteShard::default()))
+            .collect();
         Self {
             config,
             post_shards,
             author_shards,
+            quote_shards,
             tracked_posts_total: AtomicUsize::new(0),
             tracked_authors_total: AtomicUsize::new(0),
+            tracked_quotes_total: AtomicUsize::new(0),
         }
     }
 
@@ -270,12 +356,13 @@ impl NetworkTracker {
         &self.config
     }
 
-    /// Returns current hot-post and author-distress table sizes.
+    /// Returns current hot-post, author-distress, and catalyst-quote table sizes.
     #[must_use]
     pub fn snapshot(&self) -> TrackerSnapshot {
         TrackerSnapshot {
             tracked_posts: self.tracked_posts_total.load(Ordering::Relaxed),
             tracked_authors: self.tracked_authors_total.load(Ordering::Relaxed),
+            tracked_quotes: self.tracked_quotes_total.load(Ordering::Relaxed),
         }
     }
 
@@ -395,6 +482,15 @@ impl NetworkTracker {
             medium_cutoff,
         );
 
+        if kind == InteractionKind::Quote {
+            self.register_catalyst_quote(
+                &interaction_post_uri,
+                focal_post_uri,
+                &commit.did,
+                now_us,
+            );
+        }
+
         let shard_cap = (self.config.max_tracked_posts / NUM_SHARDS).max(1);
         let sidx = shard_idx(focal_post_uri);
         let mut guard = self.post_shards[sidx].lock();
@@ -460,9 +556,64 @@ impl NetworkTracker {
             });
         }
 
-        let candidate =
-            self.maybe_build_candidate(bucket, distress, now_us, short_cutoff, cooldown_us);
+        let candidate = self.maybe_build_candidate(
+            bucket,
+            distress,
+            now_us,
+            short_cutoff,
+            medium_cutoff,
+            cooldown_us,
+        );
         ObserveOutcome::PostInteraction(candidate)
+    }
+
+    fn register_catalyst_quote(
+        &self,
+        quote_uri: &str,
+        focal_post_uri: &str,
+        quote_author_did: &str,
+        now_us: u64,
+    ) {
+        let shard_cap = (self.config.max_tracked_posts / NUM_SHARDS).max(1);
+        let sidx = shard_idx(quote_uri);
+        let mut guard = self.quote_shards[sidx].lock();
+
+        if !guard.quotes.contains_key(quote_uri) && guard.quotes.len() >= shard_cap {
+            if let Some(evict_key) = guard
+                .quotes
+                .iter()
+                .min_by_key(|(_, b)| {
+                    (
+                        b.live_likes.len().saturating_add(b.live_reposts.len()),
+                        b.last_seen_us,
+                    )
+                })
+                .map(|(k, _)| k.clone())
+            {
+                if guard.quotes.remove(&evict_key).is_some() {
+                    self.tracked_quotes_total.fetch_sub(1, Ordering::Relaxed);
+                }
+            }
+        }
+
+        let is_new = !guard.quotes.contains_key(quote_uri);
+        let qbucket = guard
+            .quotes
+            .entry(quote_uri.to_string())
+            .or_insert_with(|| {
+                CatalystQuoteBucket::new(
+                    focal_post_uri.to_string(),
+                    quote_author_did.to_string(),
+                    now_us,
+                )
+            });
+        if is_new {
+            self.tracked_quotes_total.fetch_add(1, Ordering::Relaxed);
+        } else {
+            qbucket.focal_post_uri = focal_post_uri.to_string();
+            qbucket.quote_author_did = quote_author_did.to_string();
+        }
+        qbucket.last_seen_us = now_us;
     }
 
     fn observe_hot_engagement(&self, commit: &JetstreamCommit, is_like: bool) -> ObserveOutcome {
@@ -478,22 +629,126 @@ impl NetworkTracker {
         };
 
         let sidx = shard_idx(subject_uri);
-        let mut guard = self.post_shards[sidx].lock();
-        let Some(bucket) = guard.posts.get_mut(subject_uri) else {
+        let now_us = commit.time_us;
+        let short_cutoff = now_us.saturating_sub(duration_to_us(self.config.short_window));
+        let medium_cutoff = now_us.saturating_sub(duration_to_us(self.config.medium_window));
+        let mut matched_hot = false;
+
+        // Scope 1: track live engagement on hot focal posts (zero-allocation cold lookup).
+        {
+            let mut guard = self.post_shards[sidx].lock();
+            if let Some(bucket) = guard.posts.get_mut(subject_uri) {
+                matched_hot = true;
+                if commit.did != bucket.target_did {
+                    let list = if is_like {
+                        &mut bucket.live_likes
+                    } else {
+                        &mut bucket.live_reposts
+                    };
+                    if list.len() < MAX_LIVE_ENGAGEMENT_EVENTS {
+                        list.push_back(now_us);
+                    }
+                }
+            }
+        }
+
+        // Scope 2: always check quote_shards even if subject_uri also matched post_shards.
+        let catalyst_trigger: Option<(String, usize)> = {
+            let mut guard = self.quote_shards[sidx].lock();
+            if let Some(qbucket) = guard.quotes.get_mut(subject_uri) {
+                matched_hot = true;
+                if commit.did != qbucket.quote_author_did {
+                    qbucket.last_seen_us = now_us;
+                    qbucket.prune(medium_cutoff);
+                    let list = if is_like {
+                        &mut qbucket.live_likes
+                    } else {
+                        &mut qbucket.live_reposts
+                    };
+                    if list.len() < MAX_LIVE_ENGAGEMENT_EVENTS {
+                        list.push_back(now_us);
+                    }
+                    if is_like {
+                        let cat_likes = qbucket.likes_since(medium_cutoff);
+                        let next_threshold = if qbucket.last_triggered_likes == 0 {
+                            self.config.min_catalyst_likes
+                        } else {
+                            qbucket.last_triggered_likes.saturating_mul(2)
+                        };
+                        let attempt_ready = qbucket.last_attempt_likes == 0
+                            || cat_likes
+                                >= qbucket
+                                    .last_attempt_likes
+                                    .saturating_add(CATALYST_RETRY_LIKE_STEP);
+                        if cat_likes >= next_threshold && attempt_ready {
+                            qbucket.last_attempt_likes = cat_likes;
+                            Some((qbucket.focal_post_uri.clone(), cat_likes))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+
+        if !matched_hot {
             // Cold path: zero allocations!
             return ObserveOutcome::Ignored;
-        };
-        if commit.did == bucket.target_did {
-            return ObserveOutcome::HotEngagementUpdated;
         }
-        let list = if is_like {
-            &mut bucket.live_likes
-        } else {
-            &mut bucket.live_reposts
-        };
-        if list.len() < 4_096 {
-            list.push_back(commit.time_us);
+
+        if let Some((focal_uri, cat_likes)) = catalyst_trigger {
+            // Scope 3: read target author distress independently before locking post_shards.
+            let distress = if let Some(target_did) = parse_did_from_at_uri(&focal_uri) {
+                self.read_distress_and_remember_focal(
+                    target_did,
+                    &focal_uri,
+                    now_us,
+                    short_cutoff,
+                    medium_cutoff,
+                )
+            } else {
+                (0, 0, 0)
+            };
+
+            // Scope 4: evaluate quoted focal post with catalyst like count.
+            let candidate = {
+                let fidx = shard_idx(&focal_uri);
+                let mut post_guard = self.post_shards[fidx].lock();
+                if let Some(bucket) = post_guard.posts.get_mut(&focal_uri) {
+                    bucket.prune(medium_cutoff);
+                    bucket.last_seen_us = bucket.last_seen_us.max(now_us);
+                    bucket.catalyst_likes_medium = bucket.catalyst_likes_medium.max(cat_likes);
+                    bucket.catalyst_likes_updated_us = bucket.catalyst_likes_updated_us.max(now_us);
+                    let cooldown_us = duration_to_us(self.config.enrich_cooldown);
+                    self.maybe_build_candidate(
+                        bucket,
+                        distress,
+                        now_us,
+                        short_cutoff,
+                        medium_cutoff,
+                        cooldown_us,
+                    )
+                } else {
+                    None
+                }
+            };
+
+            if let Some(cand) = candidate {
+                // Scope 5: record successful catalyst trigger threshold.
+                let mut guard = self.quote_shards[sidx].lock();
+                if let Some(qbucket) = guard.quotes.get_mut(subject_uri) {
+                    qbucket.last_triggered_likes = cat_likes;
+                }
+                return ObserveOutcome::CatalystDunk(cand);
+            }
         }
+
         ObserveOutcome::HotEngagementUpdated
     }
 
@@ -687,9 +942,16 @@ impl NetworkTracker {
         let Some(bucket) = post_guard.posts.get_mut(&focal_uri) else {
             return ObserveOutcome::DefensiveSignal(None);
         };
+        bucket.prune(medium_cutoff);
         let cooldown_us = duration_to_us(self.config.enrich_cooldown);
-        let candidate =
-            self.maybe_build_candidate(bucket, distress, now_us, short_cutoff, cooldown_us);
+        let candidate = self.maybe_build_candidate(
+            bucket,
+            distress,
+            now_us,
+            short_cutoff,
+            medium_cutoff,
+            cooldown_us,
+        );
         ObserveOutcome::DefensiveSignal(candidate)
     }
 
@@ -699,79 +961,151 @@ impl NetworkTracker {
         distress: (usize, usize, usize),
         now_us: u64,
         short_cutoff: u64,
+        medium_cutoff: u64,
         cooldown_us: u64,
     ) -> Option<NetworkSurgeCandidate> {
-        let (unique_authors, replies, quotes, likes, reposts) = bucket.count_short(short_cutoff);
+        let (unique_authors_short, replies_short, quotes_short, likes_short, reposts_short) =
+            bucket.count_since(short_cutoff);
+        let (unique_authors_med, replies_med, quotes_med, likes_med, reposts_med) =
+            bucket.count_since(medium_cutoff);
         let distress_total = distress
             .0
             .saturating_add(distress.1)
             .saturating_add(distress.2);
         let has_distress = distress_total >= self.config.defensive_distress_threshold;
-        let has_quote_surge = quotes >= MIN_QUOTES_RATIO_BYPASS;
-        let effective_min_authors = if has_distress {
+        let has_quote_surge = quotes_short >= MIN_QUOTES_RATIO_BYPASS;
+        let effective_min_authors_short = if has_distress {
             (self.config.min_unique_authors / 2).max(2)
         } else {
             self.config.min_unique_authors
         };
-        if unique_authors < effective_min_authors {
-            return None;
-        }
+        let effective_min_authors_med = self
+            .config
+            .min_unique_authors_medium
+            .max(self.config.min_unique_authors);
 
-        let interactions_total = replies.saturating_add(quotes) as f64;
-        let all_eng = interactions_total + likes.saturating_add(reposts) as f64;
-        let streaming_share = if all_eng > 0.0 {
-            interactions_total / all_eng
+        let interactions_short = replies_short.saturating_add(quotes_short) as f64;
+        let all_eng_short = interactions_short + likes_short.saturating_add(reposts_short) as f64;
+        let streaming_share_short = if all_eng_short > 0.0 {
+            interactions_short / all_eng_short
         } else {
             1.0
         };
-        if !has_distress && !has_quote_surge && streaming_share < self.config.min_streaming_ratio {
+
+        let interactions_med = replies_med.saturating_add(quotes_med) as f64;
+        let all_eng_med = interactions_med + likes_med.saturating_add(reposts_med) as f64;
+        let streaming_share_med = if all_eng_med > 0.0 {
+            interactions_med / all_eng_med
+        } else {
+            1.0
+        };
+        let sustained_ratio_floor = self
+            .config
+            .min_streaming_ratio
+            .max(MIN_SUSTAINED_STREAMING_RATIO);
+
+        let short_velocity_ok = unique_authors_short >= effective_min_authors_short;
+        let has_sustained_burn = unique_authors_med >= effective_min_authors_med
+            && unique_authors_short >= MIN_SHORT_AUTHORS_FOR_MEDIUM_BURN
+            && streaming_share_med >= sustained_ratio_floor;
+
+        let catalyst_likes = if bucket.catalyst_likes_updated_us >= medium_cutoff {
+            bucket.catalyst_likes_medium
+        } else {
+            0
+        };
+        let streaming_dunk_ratio = compute_dunk_ratio(catalyst_likes as u64, likes_med as u64);
+        let has_catalyst_dunk = catalyst_likes >= self.config.min_catalyst_likes
+            && unique_authors_med >= MIN_CATALYST_AUTHORS
+            && streaming_dunk_ratio >= MIN_CATALYST_STREAMING_DUNK_RATIO;
+
+        if !short_velocity_ok && !has_sustained_burn && !has_catalyst_dunk {
+            return None;
+        }
+        if short_velocity_ok
+            && !has_distress
+            && !has_quote_surge
+            && !has_sustained_burn
+            && !has_catalyst_dunk
+            && streaming_share_short < self.config.min_streaming_ratio
+        {
             return None;
         }
 
-        let direct_ratio =
-            compute_direct_ratio(replies as u64, quotes as u64, likes as u64, reposts as u64);
+        let direct_ratio_short = compute_direct_ratio(
+            replies_short as u64,
+            quotes_short as u64,
+            likes_short as u64,
+            reposts_short as u64,
+        );
+        let direct_ratio = if has_sustained_burn || has_catalyst_dunk {
+            let direct_ratio_med = compute_direct_ratio(
+                replies_med as u64,
+                quotes_med as u64,
+                likes_med as u64,
+                reposts_med as u64,
+            );
+            direct_ratio_short.max(direct_ratio_med)
+        } else {
+            direct_ratio_short
+        };
         let burst_z = compute_burst_acceleration(
-            replies.saturating_add(quotes),
+            replies_short.saturating_add(quotes_short),
             self.config.short_window.as_secs_f64(),
             bucket.events.len(),
             self.config.medium_window.as_secs_f64(),
         );
+        let effective_authors = if has_sustained_burn || has_catalyst_dunk {
+            unique_authors_short.max(unique_authors_med)
+        } else {
+            unique_authors_short
+        };
+        let initial_dunk_ratio = if has_catalyst_dunk {
+            streaming_dunk_ratio
+        } else {
+            0.0
+        };
         // Optimistic OON baseline at Stage 1 (refined strictly via getRelationships in Stage 2).
         let structural = compute_structural_score(
-            unique_authors,
+            effective_authors,
             0.75,
             direct_ratio,
-            0.0,
+            initial_dunk_ratio,
             1.0,
             burst_z,
             distress_total,
             TargetTier::Unknown,
         );
-        if !has_distress && !has_quote_surge && structural < self.config.stage1_trigger_score {
+        if !has_distress
+            && !has_quote_surge
+            && !has_catalyst_dunk
+            && structural < self.config.stage1_trigger_score
+        {
             return None;
         }
 
         if let Some(last) = bucket.last_emitted_us {
             let within_cooldown = now_us.saturating_sub(last) < cooldown_us;
             let doubled_authors = bucket.last_emitted_authors > 0
-                && unique_authors >= bucket.last_emitted_authors.saturating_mul(2);
+                && effective_authors >= bucket.last_emitted_authors.saturating_mul(2);
             if within_cooldown && !doubled_authors {
                 return None;
             }
         }
         bucket.last_emitted_us = Some(now_us);
-        bucket.last_emitted_authors = unique_authors;
+        bucket.last_emitted_authors = effective_authors;
 
         let metrics = StormMetrics {
-            unique_authors_short: unique_authors,
-            unique_oon_authors_short: unique_authors,
-            reply_count_short: replies,
-            quote_count_short: quotes,
-            streaming_likes_short: likes,
-            streaming_reposts_short: reposts,
+            unique_authors_short,
+            unique_authors_medium: unique_authors_med,
+            unique_oon_authors_short: unique_authors_short,
+            reply_count_short: replies_short,
+            quote_count_short: quotes_short,
+            streaming_likes_short: likes_short,
+            streaming_reposts_short: reposts_short,
             out_of_network_ratio: 0.75,
             direct_ratio,
-            dunk_ratio: 0.0,
+            dunk_ratio: initial_dunk_ratio,
             power_asymmetry: 1.0,
             burst_z_score: burst_z,
             defensive_blocks: distress.0,
@@ -792,7 +1126,7 @@ impl NetworkTracker {
         })
     }
 
-    /// Prunes idle posts and author distress buckets older than `medium_window`, returning removed count.
+    /// Prunes idle posts, catalyst quote-posts, and author distress buckets older than `medium_window`, returning removed count.
     pub fn prune_stale(&self, now_us: u64) -> usize {
         let medium_cutoff = now_us.saturating_sub(duration_to_us(self.config.medium_window));
         let mut removed = 0usize;
@@ -805,6 +1139,18 @@ impl NetworkTracker {
                 if !keep {
                     removed += 1;
                     self.tracked_posts_total.fetch_sub(1, Ordering::Relaxed);
+                }
+                keep
+            });
+        }
+        for shard in &self.quote_shards {
+            let mut guard = shard.lock();
+            guard.quotes.retain(|_, b| {
+                b.prune(medium_cutoff);
+                let keep = b.last_seen_us >= medium_cutoff;
+                if !keep {
+                    removed += 1;
+                    self.tracked_quotes_total.fetch_sub(1, Ordering::Relaxed);
                 }
                 keep
             });
@@ -1157,5 +1503,323 @@ mod tests {
             }
             other => panic!("expected quote-surge candidate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn medium_window_sustained_burn_triggers_slow_dogpile_and_gates_benign_likes() {
+        let tracker = NetworkTracker::new(RadarConfig::default());
+        let base_us = 2_000_000_000_u64;
+
+        // 1) Slow-burn dogpile: 5 early replies + 3 late replies across 25m -> 3 in 10m, 8 in 30m.
+        let slow_offsets_secs = [0_u64, 150, 300, 450, 600, 1440, 1470, 1500];
+        let mut last_outcome = ObserveOutcome::Ignored;
+        for (idx, off_s) in slow_offsets_secs.iter().enumerate() {
+            last_outcome = tracker.observe_commit(&mk_reply(
+                &format!("did:plc:sb{idx}"),
+                "did:plc:slowtarget",
+                "3kslow",
+                base_us + off_s * 1_000_000,
+                "Slow pile-on reply",
+            ));
+            if idx < slow_offsets_secs.len() - 1 {
+                assert_eq!(last_outcome, ObserveOutcome::PostInteraction(None));
+            }
+        }
+        match last_outcome {
+            ObserveOutcome::PostInteraction(Some(cand)) => {
+                assert_eq!(
+                    cand.focal_post_uri,
+                    "at://did:plc:slowtarget/app.bsky.feed.post/3kslow"
+                );
+                assert_eq!(cand.initial_metrics.unique_authors_short, 3);
+                assert_eq!(cand.initial_metrics.unique_authors_medium, 8);
+            }
+            other => panic!("expected medium-window sustained-burn candidate, got {other:?}"),
+        }
+
+        // 2) Gate: 8 authors in 30m (two spaced bursts of 4 and 3, then 1 lone reply)
+        //    but only 1 author in 10m (< MIN_SHORT_AUTHORS_FOR_MEDIUM_BURN = 2) must NOT trigger.
+        for (idx, off_s) in [0_u64, 30, 60, 90, 740, 770, 800].iter().enumerate() {
+            assert_eq!(
+                tracker.observe_commit(&mk_reply(
+                    &format!("did:plc:one_short_{idx}"),
+                    "did:plc:one_short_target",
+                    "3kone",
+                    base_us + off_s * 1_000_000,
+                    "early",
+                )),
+                ObserveOutcome::PostInteraction(None)
+            );
+        }
+        assert_eq!(
+            tracker.observe_commit(&mk_reply(
+                "did:plc:one_short_7",
+                "did:plc:one_short_target",
+                "3kone",
+                base_us + 1_450_000_000,
+                "lone late reply",
+            )),
+            ObserveOutcome::PostInteraction(None)
+        );
+
+        // 3) Gate: benign slow-burn (8 replies + 20 likes in 30m -> streaming_share_med = 8/28 < 0.45) stays suppressed.
+        let benign_uri = "at://did:plc:benignslow/app.bsky.feed.post/3kbslow";
+        for idx in 0..5 {
+            assert_eq!(
+                tracker.observe_commit(&mk_reply(
+                    &format!("did:plc:bs{idx}"),
+                    "did:plc:benignslow",
+                    "3kbslow",
+                    base_us + (idx as u64) * 120_000_000,
+                    "nice post",
+                )),
+                ObserveOutcome::PostInteraction(None)
+            );
+        }
+        for idx in 0..20 {
+            assert_eq!(
+                tracker.observe_commit(&mk_like(
+                    &format!("did:plc:bsl{idx}"),
+                    benign_uri,
+                    base_us + 700_000_000 + (idx as u64) * 1_000_000,
+                )),
+                ObserveOutcome::HotEngagementUpdated
+            );
+        }
+        for idx in 5..8 {
+            assert_eq!(
+                tracker.observe_commit(&mk_reply(
+                    &format!("did:plc:bs{idx}"),
+                    "did:plc:benignslow",
+                    "3kbslow",
+                    base_us + 1_400_000_000 + (idx as u64) * 10_000_000,
+                    "friendly",
+                )),
+                ObserveOutcome::PostInteraction(None)
+            );
+        }
+    }
+
+    #[test]
+    fn catalyst_quote_likes_trigger_focal_post_and_gate_popular_or_solo_quotes() {
+        let tracker = NetworkTracker::new(RadarConfig::default());
+        let base_us = 3_000_000_000_u64;
+
+        let mk_quote = |author: &str, rkey: &str, quoted_uri: &str, ts_us: u64| JetstreamCommit {
+            did: author.to_string(),
+            time_us: ts_us,
+            collection: "app.bsky.feed.post".to_string(),
+            rkey: rkey.to_string(),
+            operation: CommitOperation::Create,
+            cid: Some("cidqt".to_string()),
+            record: Some(json!({
+                "text": "Look at this post",
+                "embed": {
+                    "$type": "app.bsky.embed.record",
+                    "record": { "uri": quoted_uri, "cid": "c1" }
+                }
+            })),
+        };
+        let mk_repost = |author: &str, subject_uri: &str, ts_us: u64| JetstreamCommit {
+            did: author.to_string(),
+            time_us: ts_us,
+            collection: "app.bsky.feed.repost".to_string(),
+            rkey: format!("rp-{ts_us}"),
+            operation: CommitOperation::Create,
+            cid: None,
+            record: Some(json!({ "subject": { "uri": subject_uri, "cid": "c1" } })),
+        };
+
+        // 0) Cold likes/reposts never allocate tracked_posts or tracked_quotes.
+        assert_eq!(
+            tracker.observe_commit(&mk_like(
+                "did:plc:cold",
+                "at://did:plc:nobody/app.bsky.feed.post/3k0",
+                base_us
+            )),
+            ObserveOutcome::Ignored
+        );
+        assert_eq!(tracker.snapshot().tracked_posts, 0);
+        assert_eq!(tracker.snapshot().tracked_quotes, 0);
+
+        // 1) Solo quote (unique_authors_med == 1) hitting 15 likes records catalyst_likes_medium
+        //    without emitting immediately, then emits when a 2nd author replies.
+        let solo_focal = "at://did:plc:solotgt/app.bsky.feed.post/3ksolo";
+        let solo_qt_uri = "at://did:plc:soloqt/app.bsky.feed.post/qt1";
+        assert_eq!(
+            tracker.observe_commit(&mk_quote(
+                "did:plc:soloqt",
+                "qt1",
+                solo_focal,
+                base_us + 100
+            )),
+            ObserveOutcome::PostInteraction(None)
+        );
+        assert_eq!(tracker.snapshot().tracked_quotes, 1);
+
+        // Self-like and repost don't count toward 15 likes.
+        assert_eq!(
+            tracker.observe_commit(&mk_like("did:plc:soloqt", solo_qt_uri, base_us + 200)),
+            ObserveOutcome::HotEngagementUpdated
+        );
+        assert_eq!(
+            tracker.observe_commit(&mk_repost("did:plc:rp0", solo_qt_uri, base_us + 300)),
+            ObserveOutcome::HotEngagementUpdated
+        );
+        for i in 0..15 {
+            assert_eq!(
+                tracker.observe_commit(&mk_like(
+                    &format!("did:plc:sl{i}"),
+                    solo_qt_uri,
+                    base_us + 1_000 + i
+                )),
+                ObserveOutcome::HotEngagementUpdated
+            );
+        }
+        match tracker.observe_commit(&mk_reply(
+            "did:plc:solo_r2",
+            "did:plc:solotgt",
+            "3ksolo",
+            base_us + 2_000,
+            "second responder",
+        )) {
+            ObserveOutcome::PostInteraction(Some(cand)) => {
+                assert_eq!(cand.focal_post_uri, solo_focal);
+                assert_eq!(cand.initial_metrics.unique_authors_medium, 2);
+                assert!((cand.initial_metrics.dunk_ratio - 15.0).abs() < 1e-9);
+            }
+            other => panic!("expected queued catalyst dunk trigger on 2nd reply, got {other:?}"),
+        }
+
+        // 2) Quote-post present in BOTH post_shards and quote_shards emits CatalystDunk on 15th like.
+        let focal_uri = "at://did:plc:target2/app.bsky.feed.post/3kfocal2";
+        let cat_qt_uri = "at://did:plc:bigcat/app.bsky.feed.post/qt2";
+        assert_eq!(
+            tracker.observe_commit(&mk_reply(
+                "did:plc:r1",
+                "did:plc:target2",
+                "3kfocal2",
+                base_us + 10_000,
+                "first reply",
+            )),
+            ObserveOutcome::PostInteraction(None)
+        );
+        assert_eq!(
+            tracker.observe_commit(&mk_quote(
+                "did:plc:bigcat",
+                "qt2",
+                focal_uri,
+                base_us + 11_000
+            )),
+            ObserveOutcome::PostInteraction(None)
+        );
+        // Reply to the quote-post itself so cat_qt_uri lives in BOTH post_shards and quote_shards!
+        assert_eq!(
+            tracker.observe_commit(&mk_reply(
+                "did:plc:qtcommenter",
+                "did:plc:bigcat",
+                "qt2",
+                base_us + 12_000,
+                "reply to quote",
+            )),
+            ObserveOutcome::PostInteraction(None)
+        );
+        for i in 0..14 {
+            assert_eq!(
+                tracker.observe_commit(&mk_like(
+                    &format!("did:plc:cl{i}"),
+                    cat_qt_uri,
+                    base_us + 20_000 + i
+                )),
+                ObserveOutcome::HotEngagementUpdated
+            );
+        }
+        match tracker.observe_commit(&mk_like("did:plc:cl14", cat_qt_uri, base_us + 20_014)) {
+            ObserveOutcome::CatalystDunk(cand) => {
+                assert_eq!(cand.focal_post_uri, focal_uri);
+                assert_eq!(cand.initial_metrics.unique_authors_medium, 2);
+                assert!((cand.initial_metrics.dunk_ratio - 15.0).abs() < 1e-9);
+            }
+            other => panic!("expected CatalystDunk on 15th like, got {other:?}"),
+        }
+        // Further likes before 2x (30) do not re-trigger; hitting 30 after cooldown re-triggers.
+        for i in 15..29 {
+            assert_eq!(
+                tracker.observe_commit(&mk_like(
+                    &format!("did:plc:cl{i}"),
+                    cat_qt_uri,
+                    base_us + 130_000_000 + i
+                )),
+                ObserveOutcome::HotEngagementUpdated
+            );
+        }
+        match tracker.observe_commit(&mk_like("did:plc:cl29", cat_qt_uri, base_us + 130_000_029)) {
+            ObserveOutcome::CatalystDunk(cand) => {
+                assert_eq!(cand.focal_post_uri, focal_uri);
+                assert!((cand.initial_metrics.dunk_ratio - 30.0).abs() < 1e-9);
+            }
+            other => panic!("expected 2x CatalystDunk on 30th like, got {other:?}"),
+        }
+
+        // 3) Popular focal post (20 focal likes vs 15 quote likes -> dunk ratio 0.714 < 2.0) is gated out.
+        let pop_focal = "at://did:plc:poptgt/app.bsky.feed.post/3kpop";
+        let pop_qt_uri = "at://did:plc:popqt/app.bsky.feed.post/qtpop";
+        assert_eq!(
+            tracker.observe_commit(&mk_reply(
+                "did:plc:pr1",
+                "did:plc:poptgt",
+                "3kpop",
+                base_us + 30_000,
+                "nice",
+            )),
+            ObserveOutcome::PostInteraction(None)
+        );
+        assert_eq!(
+            tracker.observe_commit(&mk_quote(
+                "did:plc:popqt",
+                "qtpop",
+                pop_focal,
+                base_us + 31_000
+            )),
+            ObserveOutcome::PostInteraction(None)
+        );
+        for i in 0..20 {
+            assert_eq!(
+                tracker.observe_commit(&mk_like(
+                    &format!("did:plc:pl{i}"),
+                    pop_focal,
+                    base_us + 32_000 + i
+                )),
+                ObserveOutcome::HotEngagementUpdated
+            );
+        }
+        for i in 0..16 {
+            assert_eq!(
+                tracker.observe_commit(&mk_like(
+                    &format!("did:plc:pql{i}"),
+                    pop_qt_uri,
+                    base_us + 33_000 + i
+                )),
+                ObserveOutcome::HotEngagementUpdated
+            );
+        }
+
+        // 4) Stale catalyst_likes_medium expires after medium_window and prune_stale clears quote_shards.
+        let exp_ts = base_us + 3_000_000_000;
+        assert!(tracker.prune_stale(exp_ts) > 0);
+        assert_eq!(tracker.snapshot().tracked_posts, 0);
+        assert_eq!(tracker.snapshot().tracked_quotes, 0);
+
+        // 5) Quote shard eviction enforces configured cap.
+        let capped = NetworkTracker::new(RadarConfig::default().with_table_caps(20, 20));
+        for i in 0..80 {
+            let _ = capped.observe_commit(&mk_quote(
+                &format!("did:plc:qc{i}"),
+                &format!("qr{i}"),
+                &format!("at://did:plc:qtgt{i}/app.bsky.feed.post/3k{i}"),
+                base_us + i as u64,
+            ));
+        }
+        assert!(capped.snapshot().tracked_quotes <= 20);
     }
 }
