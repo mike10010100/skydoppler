@@ -62,8 +62,9 @@ pub use types::{
     PostEngagementSnapshot, RadarConfig, RadarEvent, RelationshipStatus, SampleReply,
     StormCategory, StormMetrics, StormSeverity, StormStanceVerdict, StormStatus, TargetTier,
     WeatherLevel, WeatherPoint, WeatherSummary, DEFAULT_MAX_TRACKED_AUTHORS,
-    DEFAULT_MAX_TRACKED_POSTS, DEFAULT_MEDIUM_WINDOW_SECS, DEFAULT_MIN_STREAMING_RATIO,
-    DEFAULT_MIN_UNIQUE_AUTHORS, DEFAULT_PUBLIC_FOLLOWER_THRESHOLD, DEFAULT_SHORT_WINDOW_SECS,
+    DEFAULT_MAX_TRACKED_POSTS, DEFAULT_MEDIUM_WINDOW_SECS, DEFAULT_MIN_CATALYST_LIKES,
+    DEFAULT_MIN_STREAMING_RATIO, DEFAULT_MIN_UNIQUE_AUTHORS, DEFAULT_MIN_UNIQUE_AUTHORS_MEDIUM,
+    DEFAULT_PUBLIC_FOLLOWER_THRESHOLD, DEFAULT_SHORT_WINDOW_SECS,
 };
 #[cfg(feature = "web")]
 pub use web::{create_web_router, run_web_server, WebServerConfig};

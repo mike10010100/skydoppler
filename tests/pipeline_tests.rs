@@ -61,6 +61,27 @@ impl Respond for AppViewRouterMock {
                                 "record": { "text": "Cute rescue kitten photo" },
                                 "replyCount": 12, "repostCount": 900, "likeCount": 8500, "quoteCount": 2
                             })
+                        } else if uri.contains("did:plc:slowvictim") {
+                            json!({
+                                "uri": uri,
+                                "author": { "did": "did:plc:slowvictim", "handle": "slowvictim.bsky.social", "followersCount": 369 },
+                                "record": { "text": "Why are we seeing silence after two years?" },
+                                "replyCount": 39, "repostCount": 0, "likeCount": 12, "quoteCount": 2
+                            })
+                        } else if uri.contains("did:plc:qtvictim") {
+                            json!({
+                                "uri": uri,
+                                "author": { "did": "did:plc:qtvictim", "handle": "qtvictim.bsky.social", "followersCount": 180 },
+                                "record": { "text": "Hot take targeted by big quote-dunk" },
+                                "replyCount": 4, "repostCount": 0, "likeCount": 1, "quoteCount": 1
+                            })
+                        } else if uri.contains("did:plc:bigcat") {
+                            json!({
+                                "uri": uri,
+                                "author": { "did": "did:plc:bigcat", "handle": "bigcat.bsky.social", "followersCount": 45000 },
+                                "record": { "text": "Ratioing this bad take" },
+                                "replyCount": 2, "repostCount": 5, "likeCount": 60, "quoteCount": 0
+                            })
                         } else {
                             json!({
                                 "uri": uri,
@@ -83,6 +104,9 @@ impl Respond for AppViewRouterMock {
                 json!({ "did": "did:plc:pubfig", "handle": "celeb.bsky.social", "followersCount": 250000 }),
                 json!({ "did": "did:plc:benign", "handle": "artist.bsky.social", "followersCount": 18000 }),
                 json!({ "did": "did:plc:distressed", "handle": "distressed.bsky.social", "followersCount": 180 }),
+                json!({ "did": "did:plc:slowvictim", "handle": "slowvictim.bsky.social", "followersCount": 369 }),
+                json!({ "did": "did:plc:qtvictim", "handle": "qtvictim.bsky.social", "followersCount": 180 }),
+                json!({ "did": "did:plc:bigcat", "handle": "bigcat.bsky.social", "followersCount": 45000 }),
             ];
             return ResponseTemplate::new(200).set_body_json(json!({ "profiles": profiles }));
         }
@@ -491,4 +515,167 @@ async fn end_to_end_5000_commit_streaming_funnel_and_redaction_and_persistence()
     assert!(restored_engine.latest_cursor_us() > 0);
     assert!(restored_engine.stats().snapshot().cold_likes_ignored >= 4_500);
     restored_engine.run_maintenance_tick().unwrap();
+}
+
+#[tokio::test]
+async fn end_to_end_slow_burn_and_catalyst_quote_dunk_detection() {
+    let mock_ws = MockJetstreamServer::start().await.unwrap();
+    let appview = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path_regex("^/xrpc/app\\.bsky\\..*$"))
+        .respond_with(AppViewRouterMock)
+        .mount(&appview)
+        .await;
+
+    let llm = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/chat"))
+        .respond_with(StanceMockRespond)
+        .mount(&llm)
+        .await;
+
+    let mut cfg = RadarConfig::default()
+        .with_min_unique_authors(6)
+        .with_min_unique_authors_medium(8)
+        .with_min_catalyst_likes(15)
+        .with_enable_llm_stance(true);
+    cfg.appview_rps = 200.0;
+
+    let stance = Arc::new(
+        LlmStormStanceClassifier::new(StanceConfig {
+            base_url: format!("{}/api/chat", llm.uri()),
+            model: "qwen3.5:9b".to_string(),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+
+    let engine = Arc::new(
+        SkydopplerEngineBuilder::new(cfg)
+            .with_appview_endpoint(appview.uri())
+            .with_stance_classifier(stance)
+            .build()
+            .unwrap(),
+    );
+
+    let (tx, rx) = mpsc::channel(2_048);
+    let cancel = CancellationToken::new();
+
+    let s_cancel = cancel.clone();
+    let stream_cfg = StreamConfig::new(mock_ws.ws_url());
+    let stream_handle =
+        tokio::spawn(async move { run_jetstream_streamer(stream_cfg, tx, s_cancel).await });
+
+    let e_ref = Arc::clone(&engine);
+    let e_cancel = cancel.clone();
+    let eng_handle = tokio::spawn(async move { e_ref.run(rx, e_cancel).await });
+
+    for _ in 0..50 {
+        if mock_ws.active_connections() >= 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(mock_ws.active_connections() >= 1);
+
+    // 1) Slow-burn dogpile across 25 minutes peaking at 3 authors in 10m and 8 in 30m.
+    let slow_root = "at://did:plc:slowvictim/app.bsky.feed.post/3kslow";
+    let slow_base = current_time_us().saturating_sub(1_600_000_000);
+    for (idx, off_s) in [0_u64, 150, 300, 450, 600, 1440, 1470, 1500]
+        .iter()
+        .enumerate()
+    {
+        mock_ws
+            .emit_commit_payload(
+                &format!("did:plc:slow_oon_{idx}"),
+                slow_base + off_s * 1_000_000,
+                "app.bsky.feed.post",
+                &format!("3ksr{idx}"),
+                "create",
+                Some("cids"),
+                Some(json!({
+                    "text": format!("Slow pile-on reply #{idx}"),
+                    "reply": { "root": { "uri": slow_root }, "parent": { "uri": slow_root } }
+                })),
+            )
+            .unwrap();
+    }
+
+    // 2) Catalyst quote-post accumulating 16 live likes alongside 1 reply triggers CatalystDunk.
+    let qt_victim_root = "at://did:plc:qtvictim/app.bsky.feed.post/3kqtvictim";
+    let cat_qt_uri = "at://did:plc:bigcat/app.bsky.feed.post/3kbigcatqt";
+    let qt_base = current_time_us().saturating_sub(10_000_000);
+    mock_ws
+        .emit_commit_payload(
+            "did:plc:qt_early",
+            qt_base,
+            "app.bsky.feed.post",
+            "3kqtr0",
+            "create",
+            Some("cidq0"),
+            Some(json!({
+                "text": "Early critical reply",
+                "reply": { "root": { "uri": qt_victim_root }, "parent": { "uri": qt_victim_root } }
+            })),
+        )
+        .unwrap();
+    mock_ws
+        .emit_commit_payload(
+            "did:plc:bigcat",
+            qt_base + 1_000,
+            "app.bsky.feed.post",
+            "3kbigcatqt",
+            "create",
+            Some("cidcatqt"),
+            Some(json!({
+                "text": "Ratioing this bad take",
+                "embed": {
+                    "$type": "app.bsky.embed.record",
+                    "record": { "uri": qt_victim_root, "cid": "cidqv" }
+                }
+            })),
+        )
+        .unwrap();
+    for idx in 0..16 {
+        mock_ws
+            .emit_commit_payload(
+                &format!("did:plc:catliker_{idx}"),
+                qt_base + 2_000 + (idx as u64) * 1_000,
+                "app.bsky.feed.like",
+                &format!("3kql{idx}"),
+                "create",
+                None,
+                Some(json!({ "subject": { "uri": cat_qt_uri, "cid": "cidcatqt" } })),
+            )
+            .unwrap();
+    }
+
+    let mut storms = Vec::new();
+    for _ in 0..80 {
+        storms = engine.list_storms(true, 100).unwrap();
+        if storms.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    cancel.cancel();
+    let final_stats = eng_handle.await.unwrap().unwrap();
+    let _ = stream_handle.await;
+
+    let slow_storm = storms
+        .iter()
+        .find(|s| s.focal_post_uri == slow_root)
+        .expect("slow-burn dogpile should confirm end-to-end");
+    assert_eq!(slow_storm.category, StormCategory::Dogpile);
+    assert_eq!(slow_storm.metrics.unique_authors_short, 3);
+    assert_eq!(slow_storm.metrics.unique_authors_medium, 8);
+
+    let qt_storm = storms
+        .iter()
+        .find(|s| s.focal_post_uri == qt_victim_root)
+        .expect("catalyst quote dunk should confirm end-to-end");
+    assert_eq!(qt_storm.category, StormCategory::Dogpile);
+    assert!(qt_storm.top_catalyst.is_some());
+    assert!(final_stats.hot_likes_observed >= 16);
 }

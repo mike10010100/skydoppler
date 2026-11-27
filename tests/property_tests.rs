@@ -194,16 +194,17 @@ proptest! {
 
     #[test]
     fn tracker_never_exceeds_configured_table_caps(
-        ops in prop::collection::vec((0u16..150, 0u16..150, any::<bool>()), 1..160),
+        ops in prop::collection::vec((0u16..150, 0u16..150, 0u8..3), 1..180),
     ) {
         let cfg = RadarConfig::default().with_table_caps(24, 20);
         let tracker = NetworkTracker::new(cfg);
 
         let mut ts = 1_700_000_000_000_000_u64;
-        for (target_idx, actor_idx, is_block) in ops {
+        for (target_idx, actor_idx, op_kind) in ops {
             ts += 1_000;
-            let commit = if is_block {
-                JetstreamCommit {
+            let root_uri = format!("at://did:plc:tgt{target_idx}/app.bsky.feed.post/3k{target_idx}");
+            let commit = match op_kind {
+                0 => JetstreamCommit {
                     did: format!("did:plc:tgt{target_idx}"),
                     time_us: ts,
                     collection: "app.bsky.graph.block".to_string(),
@@ -211,10 +212,8 @@ proptest! {
                     operation: CommitOperation::Create,
                     cid: None,
                     record: Some(json!({ "subject": format!("did:plc:act{actor_idx}") })),
-                }
-            } else {
-                let root_uri = format!("at://did:plc:tgt{target_idx}/app.bsky.feed.post/3k{target_idx}");
-                JetstreamCommit {
+                },
+                1 => JetstreamCommit {
                     did: format!("did:plc:act{actor_idx}"),
                     time_us: ts,
                     collection: "app.bsky.feed.post".to_string(),
@@ -225,12 +224,28 @@ proptest! {
                         "text": "replying",
                         "reply": { "root": { "uri": root_uri }, "parent": { "uri": root_uri } }
                     })),
-                }
+                },
+                _ => JetstreamCommit {
+                    did: format!("did:plc:act{actor_idx}"),
+                    time_us: ts,
+                    collection: "app.bsky.feed.post".to_string(),
+                    rkey: format!("rk{ts}"),
+                    operation: CommitOperation::Create,
+                    cid: Some(format!("cid{ts}")),
+                    record: Some(json!({
+                        "text": "quoting",
+                        "embed": {
+                            "$type": "app.bsky.embed.record",
+                            "record": { "uri": root_uri, "cid": "cidroot" }
+                        }
+                    })),
+                },
             };
             let _ = tracker.observe_commit(&commit);
             let snap = tracker.snapshot();
             prop_assert!(snap.tracked_posts <= 24);
             prop_assert!(snap.tracked_authors <= 20);
+            prop_assert!(snap.tracked_quotes <= 24);
         }
     }
 }

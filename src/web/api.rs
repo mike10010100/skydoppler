@@ -378,6 +378,17 @@ pub async fn get_prometheus_metrics(State(state): State<ApiState>) -> Response {
 
     let _ = writeln!(
         out,
+        "\n# HELP skydoppler_tracked_quotes Catalyst quote-posts currently indexed across 16 quote shards."
+    );
+    let _ = writeln!(out, "# TYPE skydoppler_tracked_quotes gauge");
+    let _ = writeln!(
+        out,
+        "skydoppler_tracked_quotes {}",
+        tracker_snap.tracked_quotes
+    );
+
+    let _ = writeln!(
+        out,
         "\n# HELP skydoppler_build_info Build and version metadata."
     );
     let _ = writeln!(out, "# TYPE skydoppler_build_info gauge");

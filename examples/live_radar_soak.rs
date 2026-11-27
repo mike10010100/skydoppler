@@ -110,6 +110,7 @@ async fn main() -> skydoppler::Result<()> {
             errors = stats.errors_encountered,
             tracked_posts = snap.tracked_posts,
             tracked_authors = snap.tracked_authors,
+            tracked_quotes = snap.tracked_quotes,
             weather_index = %format!("{:.1}", weather.weather_index),
             level = %weather.level,
             "Soak telemetry"

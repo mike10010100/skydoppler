@@ -14,6 +14,10 @@ pub const DEFAULT_SHORT_WINDOW_SECS: u64 = 600;
 pub const DEFAULT_MEDIUM_WINDOW_SECS: u64 = 1800;
 /// Default minimum unique responder DIDs before Stage 2 AppView enrichment triggers.
 pub const DEFAULT_MIN_UNIQUE_AUTHORS: usize = 6;
+/// Default minimum distinct responder DIDs in `medium_window` for sustained-burn triggers.
+pub const DEFAULT_MIN_UNIQUE_AUTHORS_MEDIUM: usize = 8;
+/// Default minimum live likes on a tracked quote-post catalyst in `medium_window`.
+pub const DEFAULT_MIN_CATALYST_LIKES: usize = 15;
 /// Default minimum streaming replies+quotes / (likes+reposts+replies+quotes) ratio trigger.
 pub const DEFAULT_MIN_STREAMING_RATIO: f64 = 0.30;
 /// Default hard cap on concurrently tracked hot posts across all shards.
@@ -32,6 +36,10 @@ pub struct RadarConfig {
     pub medium_window: Duration,
     /// Minimum distinct authors in `short_window` required to emit a Stage 2 surge candidate.
     pub min_unique_authors: usize,
+    /// Minimum distinct authors in `medium_window` required to emit a sustained-burn Stage 2 candidate.
+    pub min_unique_authors_medium: usize,
+    /// Minimum live likes on a tracked quote-post catalyst in `medium_window` required to trigger evaluation.
+    pub min_catalyst_likes: usize,
     /// Minimum defensive distress events (blocks / postgate detaches / threadgates) lowering Stage 1 threshold.
     pub defensive_distress_threshold: usize,
     /// Minimum Stage 1 streaming ratio (`(replies+quotes) / (likes+reposts+replies+quotes)`) when no distress burst.
@@ -72,6 +80,8 @@ impl Default for RadarConfig {
             short_window: Duration::from_secs(DEFAULT_SHORT_WINDOW_SECS),
             medium_window: Duration::from_secs(DEFAULT_MEDIUM_WINDOW_SECS),
             min_unique_authors: DEFAULT_MIN_UNIQUE_AUTHORS,
+            min_unique_authors_medium: DEFAULT_MIN_UNIQUE_AUTHORS_MEDIUM,
+            min_catalyst_likes: DEFAULT_MIN_CATALYST_LIKES,
             defensive_distress_threshold: 2,
             min_streaming_ratio: DEFAULT_MIN_STREAMING_RATIO,
             max_tracked_posts: DEFAULT_MAX_TRACKED_POSTS,
@@ -106,14 +116,22 @@ impl RadarConfig {
         )
         .max(short_secs);
 
+        let min_unique_authors =
+            crate::env::parsed_or(&["SKYDOPPLER_MIN_UNIQUE_AUTHORS"], d.min_unique_authors).max(1);
+        let min_unique_authors_medium = crate::env::parsed_or(
+            &["SKYDOPPLER_MIN_UNIQUE_AUTHORS_MEDIUM"],
+            d.min_unique_authors_medium,
+        )
+        .max(min_unique_authors);
+        let min_catalyst_likes =
+            crate::env::parsed_or(&["SKYDOPPLER_MIN_CATALYST_LIKES"], d.min_catalyst_likes).max(1);
+
         Self {
             short_window: Duration::from_secs(short_secs),
             medium_window: Duration::from_secs(medium_secs),
-            min_unique_authors: crate::env::parsed_or(
-                &["SKYDOPPLER_MIN_UNIQUE_AUTHORS"],
-                d.min_unique_authors,
-            )
-            .max(1),
+            min_unique_authors,
+            min_unique_authors_medium,
+            min_catalyst_likes,
             defensive_distress_threshold: crate::env::parsed_or(
                 &["SKYDOPPLER_DISTRESS_THRESHOLD"],
                 d.defensive_distress_threshold,
@@ -209,6 +227,20 @@ impl RadarConfig {
     #[must_use]
     pub fn with_min_unique_authors(mut self, min: usize) -> Self {
         self.min_unique_authors = min.max(1);
+        self
+    }
+
+    /// Sets the minimum distinct responders in `medium_window` for sustained-burn Stage 1 triggers.
+    #[must_use]
+    pub fn with_min_unique_authors_medium(mut self, min: usize) -> Self {
+        self.min_unique_authors_medium = min.max(1);
+        self
+    }
+
+    /// Sets the minimum live likes on a tracked quote-post catalyst in `medium_window`.
+    #[must_use]
+    pub fn with_min_catalyst_likes(mut self, min: usize) -> Self {
+        self.min_catalyst_likes = min.max(1);
         self
     }
 
@@ -648,6 +680,9 @@ impl StormStanceVerdict {
 pub struct StormMetrics {
     /// Distinct responder DIDs in `short_window`.
     pub unique_authors_short: usize,
+    /// Distinct responder DIDs in `medium_window`.
+    #[serde(default)]
+    pub unique_authors_medium: usize,
     /// Sampled out-of-network responders count (refined in Stage 2 via `getRelationships`).
     pub unique_oon_authors_short: usize,
     /// Replies observed in `short_window`.
@@ -850,6 +885,8 @@ mod tests {
             .with_short_window(Duration::from_secs(120))
             .with_medium_window(Duration::from_secs(60))
             .with_min_unique_authors(0)
+            .with_min_unique_authors_medium(0)
+            .with_min_catalyst_likes(0)
             .with_table_caps(5, 4)
             .with_public_follower_threshold(10_000)
             .with_enable_llm_stance(true)
@@ -859,6 +896,8 @@ mod tests {
         // medium_window clamped to at least short_window
         assert_eq!(cfg.medium_window, Duration::from_secs(120));
         assert_eq!(cfg.min_unique_authors, 1);
+        assert_eq!(cfg.min_unique_authors_medium, 1);
+        assert_eq!(cfg.min_catalyst_likes, 1);
         assert_eq!(cfg.max_tracked_posts, 16);
         assert_eq!(cfg.max_tracked_authors, 16);
         assert_eq!(cfg.public_follower_threshold, 10_000);

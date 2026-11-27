@@ -379,9 +379,14 @@ impl LlmStormStanceClassifier {
             let _ = writeln!(out, "Focal URI: {}", input.focal_post_uri);
         }
 
+        let med_note = if input.metrics.unique_authors_medium > input.metrics.unique_authors_short {
+            format!(", authors_30m={}", input.metrics.unique_authors_medium)
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
-            "Metrics: oon_authors={}, oon_ratio={:.2}, direct_ratio={:.2}, dunk_ratio={:.2}, power_asymmetry={:.2}",
+            "Metrics: oon_authors={}, oon_ratio={:.2}, direct_ratio={:.2}, dunk_ratio={:.2}, power_asymmetry={:.2}{med_note}",
             input.metrics.unique_oon_authors_short,
             input.metrics.out_of_network_ratio,
             input.metrics.direct_ratio,
@@ -774,6 +779,13 @@ mod tests {
         let prompt_str = LlmStormStanceClassifier::format_bundle_prompt(&sample_input());
         assert!(prompt_str.contains("Target Bio: \"Indie game artist and coffee fan\""));
         assert!(prompt_str.contains("embed=images"));
+        assert!(!prompt_str.contains("authors_30m="));
+
+        let mut slow_burn_input = sample_input();
+        slow_burn_input.metrics.unique_authors_short = 3;
+        slow_burn_input.metrics.unique_authors_medium = 9;
+        let slow_prompt = LlmStormStanceClassifier::format_bundle_prompt(&slow_burn_input);
+        assert!(slow_prompt.contains("authors_30m=9"));
 
         // Third-party news/subject outrage deterministically normalizes to BenignViral + non-hostile
         let news_ollama = MockServer::start().await;

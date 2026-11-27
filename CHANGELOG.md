@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-11-27
+
+### Added
+
+- **Medium-Window (`30m`) Sustained-Burn Trigger (`src/types.rs`, `src/tracker.rs`, `.env.example`)**:
+  - Added `DEFAULT_MIN_UNIQUE_AUTHORS_MEDIUM = 8` (`SKYDOPPLER_MIN_UNIQUE_AUTHORS_MEDIUM`) and backward-compatible `#[serde(default)] StormMetrics::unique_authors_medium` to catch slow-burn dogpiles spanning `30m` that stay below the `10m` velocity threshold, guarded by a `0.45` sustained streaming ratio floor and `>= 2` short-window responders.
+- **Bounded 16-Shard Catalyst Quote-Post Index (`src/tracker.rs`, `src/types.rs`, `src/web/api.rs`)**:
+  - Indexed quote-posts (`app.bsky.embed.record` / `recordWithMedia`) in bounded `quote_shards` (`DEFAULT_MIN_CATALYST_LIKES = 15`, `SKYDOPPLER_MIN_CATALYST_LIKES`), routing live quote-post likes back to quoted focal posts as `ObserveOutcome::CatalystDunk` while preserving zero-allocation cold lookups and single-lock scoping.
+  - Exported `TrackerSnapshot::tracked_quotes` and the `skydoppler_tracked_quotes` Prometheus gauge.
+
+### Changed
+
+- **Stage 2/3 OON Scoring, Catalyst Qualification & Prompt Context (`src/engine.rs`, `src/stance.rs`)**:
+  - Scaled `unique_oon_authors_medium`, incorporated `effective_oon_authors = max(short, medium)` into structural scoring and benign-verdict cache activity tracking, enabled verified high-dunk catalyst qualification (`like_count >= 15`, `dunk_ratio >= 2.0`, `>= 2` OON authors) for `Small`/`Mid`/`Unknown` targets, and included `authors_30m=` in Stage 3 LLM stance prompts when medium-window responders exceed the short window.
+
 ## [0.3.3] - 2026-11-23
 
 ### Changed
